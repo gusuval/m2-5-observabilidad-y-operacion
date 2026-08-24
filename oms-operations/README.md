@@ -1,7 +1,7 @@
 # OMS Operations — Trabajo final Bloque 5
 
 Esqueleto del trabajo final del **Bloque 5 · Operación y observabilidad**.
-El enunciado completo está en `Trabajo - enunciado.md`.
+El enunciado completo está en `../Trabajo - enunciado.md`.
 
 ## Estructura
 
@@ -16,7 +16,7 @@ oms-operations/
 
 ## Cómo arrancar
 
-1. **Lee el enunciado** completo (`Trabajo - enunciado.md`).
+1. **Lee el enunciado** completo (`../Trabajo - enunciado.md`).
 2. **Empieza por la instrumentación** — necesitas tener claro qué medirías antes de poder definir SLOs y alertas:
    ```bash
    ${EDITOR:-vim} observability/instrumentation.md
@@ -73,6 +73,6 @@ Sección obligatoria con los **3 trade-offs principales** que tomaste durante el
 
 ## Si te bloqueas
 
-- Vuelve al vídeo correspondiente (mapeo en `Trabajo - enunciado.md` §7)
+- Vuelve al vídeo correspondiente (mapeo en `../Trabajo - enunciado.md` §7)
 - Canal Slack `#trabajo-bloque-5`
 - Lee tus runbooks en voz alta como si fueras el on-call a las 3 AM
