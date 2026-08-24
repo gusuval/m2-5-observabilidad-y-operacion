@@ -31,7 +31,7 @@ Producir un repositorio Git con la documentación operativa completa del OMS:
 - **1 GameDay plan** que valida uno de tus runbooks
 - **1 documento de instrumentación** que dice qué se monitoriza en cada módulo del OMS y por qué
 
-Todo el trabajo aplica sobre la arquitectura del OMS (la del `03-arquitectura.md`). Donde necesites comandos concretos, puedes usar la demo `codecrypto-ai` del handoff como referencia.
+Todo el trabajo aplica sobre la arquitectura del OMS (la del `anexo-arquitectura/03-arquitectura.md`). Donde necesites comandos concretos, puedes usar la demo `codecrypto-ai` del handoff como referencia.
 
 ---
 
