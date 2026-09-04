@@ -1,5 +1,8 @@
 # m2-5-observabilidad-y-operacion
 
+📄 **El enunciado del trabajo está en [Trabajo - enunciado.md](./Trabajo%20-%20enunciado.md)** — léelo primero: es la guía principal de lo que se pide.
+
+
 <!-- BEGIN cc:que-se-valora -->
 ## 📋 Qué se valora
 
