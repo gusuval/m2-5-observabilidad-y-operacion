@@ -176,10 +176,10 @@ Si tu runbook viene de un prompt y no lo has revisado críticamente, se nota en 
 
 ## 9 · Cómo entregar
 
-1. Clona este esqueleto en un repo privado
+1. Haz fork de este esqueleto en el GitLab del campus (es el repo que entregarás)
 2. Completa los `TODO` (búscalos con `grep -r TODO`)
 3. Para cada runbook, **léelo en voz alta como si fueras el on-call a las 3 AM**: ¿podrías seguirlo sin pararte a pensar? Si no, falta detalle.
-4. Comparte el repo con el correo del instructor
+4. Entrega desde el campus con el botón «Entregar»: indica tu repo de GitLab y sube el vídeo. No hace falta compartir el repo ni enviar nada por correo: los profesores ya tenemos acceso.
 5. Tag de release `v1.0.0` apuntando al commit final
 
 ---
