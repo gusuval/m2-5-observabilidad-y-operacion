@@ -1,0 +1,118 @@
+# Alertas de Prometheus para el runbook 12-server-cpu-high.
+# Métricas de Cloud Run vía stackdriver_exporter (observability/instrumentation.md):
+#   - run_container_cpu_utilization: distribución de Cloud Monitoring (container/cpu/utilizations),
+#     exportada como histograma (_bucket) por job (= servicio) y revision. Valores de 0 a 1.
+#   - run_instance_count (gauge, por job y state) y run_max_instances (gauge, maxScale configurado).
+#
+# Diseño:
+#   - El autoescalado de Cloud Run apunta al 60 % de CPU. Un p99 > 85 % sostenido 10 min significa
+#     que el autoescalado no alcanza: warning (Slack), todavía con margen.
+#   - critical solo si además el servicio está al ≥ 90 % de max-instances: ya no puede escalar y lo
+#     siguiente son 429. Alertmanager inhibe la warning cuando está la critical (mismo alertname + job).
+#   - CloudRunAtMaxInstances: 5 min (no 10) porque al máximo las peticiones ya hacen cola.
+#     oms-outbox-relay queda fuera: su techo es 2 y llegar a él con backlog es normal (runbook 04).
+#   - V3: Cloud Armor con reglas permanentes (Terraform) y un drift check horario que se vigila aquí.
+#     La salud de oms-ops-flag-automator (que también actúa sobre esta alerta) la vigila
+#     FlagAutomatorStale en observability/ops-automation-alerts.yaml.
+
+groups:
+  - name: cloudrun-cpu-recording
+    interval: 30s
+    rules:
+      - record: job:run_container_cpu_utilization:p99_5m
+        expr: |
+          histogram_quantile(0.99, sum by (le, job) (rate(run_container_cpu_utilization_bucket{job=~"oms-catalog|oms-orders|oms-outbox-relay"}[5m])))
+      - record: job:run_instances:ratio_max
+        expr: |
+          sum by (job) (run_instance_count{job=~"oms-catalog|oms-orders|oms-outbox-relay"})
+          / on (job)
+          max by (job) (run_max_instances{job=~"oms-catalog|oms-orders|oms-outbox-relay"})
+
+  - name: cloudrun-cpu
+    interval: 30s
+    rules:
+
+      - alert: CloudRunCPUSaturated
+        expr: |
+          job:run_container_cpu_utilization:p99_5m > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "12-server-cpu-high"
+          automation: "flag-automator"     # V3: pausa PDF (oms-orders) o sugerencias (oms-catalog)
+        annotations:
+          summary: "CPU p99 de {{ $labels.job }} al {{ $value | humanizePercentage }} (> 85 %) desde hace 10 min"
+          description: |
+            Las instancias de Cloud Run de {{ $labels.job }} llevan 10 min con la CPU p99 al {{ $value | humanizePercentage }}.
+            El autoescalado (objetivo 60 %) no está alcanzando. Todavía hay margen de instancias.
+            Diagnóstico 1 (¿bot o tráfico legítimo?) y 3 (¿qué trabajo caro?). oms-ops-flag-automator
+            ya habrá encendido el flag de trabajo caro del servicio: compruébalo con flag_get.
+          runbook_url: "https://runbooks.example.com/12-server-cpu-high?job={{ $labels.job }}&cpu_p99={{ $value | printf \"%.2f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=cloudrun-cpu&var-job={{ $labels.job }}&from=now-3h&to=now"
+
+      - alert: CloudRunCPUSaturated
+        expr: |
+          job:run_container_cpu_utilization:p99_5m > 0.85
+          and on (job)
+          job:run_instances:ratio_max >= 0.9
+        for: 10m
+        labels:
+          severity: critical
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "12-server-cpu-high"
+        annotations:
+          summary: "CPU p99 de {{ $labels.job }} al {{ $value | humanizePercentage }} y casi sin margen de instancias"
+          description: |
+            {{ $labels.job }} tiene la CPU p99 al {{ $value | humanizePercentage }} y está al ≥ 90 % de max-instances.
+            No puede escalar más: lo siguiente es latencia alta y 429. Antes de subir max-instances,
+            haz la cuenta de la fórmula de capacidad del pool (diagnóstico 5, límite 380 conexiones).
+          runbook_url: "https://runbooks.example.com/12-server-cpu-high?job={{ $labels.job }}&cpu_p99={{ $value | printf \"%.2f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=cloudrun-cpu&var-job={{ $labels.job }}&from=now-3h&to=now"
+
+      - alert: CloudRunAtMaxInstances
+        expr: |
+          sum by (job) (run_instance_count{job=~"oms-catalog|oms-orders"})
+          >= on (job)
+          max by (job) (run_max_instances{job=~"oms-catalog|oms-orders"})
+        for: 5m
+        labels:
+          severity: critical
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "12-server-cpu-high"
+        annotations:
+          summary: "{{ $labels.job }} al máximo de instancias ({{ $value }}) desde hace 5 min"
+          description: |
+            {{ $labels.job }} tiene {{ $value }} instancias, su max-instances. Cloud Run no crea más: las peticiones
+            hacen cola y, si la cola se llena, reciben 429. Diagnóstico 1: si es un bot, Acción 2 (Cloud Armor);
+            si es tráfico legítimo, Acción 1 y Acción 3 respetando la fórmula del pool (< 380 conexiones).
+          runbook_url: "https://runbooks.example.com/12-server-cpu-high?job={{ $labels.job }}&instances={{ $value }}&section=capacidad"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=cloudrun-instances&var-job={{ $labels.job }}&from=now-3h&to=now"
+
+  # ─── V3: las defensas preventivas también se vigilan ───
+  - name: cloudrun-cpu-automation
+    interval: 60s
+    rules:
+      - alert: CloudArmorPolicyCheckStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="armor-drift-check"}) > 3 * 3600
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="armor-drift-check"})
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "12-server-cpu-high"
+        annotations:
+          summary: "El drift check de Cloud Armor (oms-edge-policy) no termina con éxito desde hace > 3 h"
+          description: |
+            El Cloud Run Job oms-ops-armor-drift comprueba cada hora que oms-edge-policy tiene las reglas
+            permanentes de rate limit (prioridades 1000 y 1100) y Adaptive Protection activo, tal como están en
+            Terraform. Si falla, alguien ha cambiado la política a mano o el job está roto: el catálogo
+            vuelve a estar expuesto a scraping como en el PM #1.
+          runbook_url: "https://runbooks.example.com/12-server-cpu-high?section=automatizacion&job=armor-drift-check"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=ops-automation"

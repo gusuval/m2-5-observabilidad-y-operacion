@@ -1,0 +1,136 @@
+# Alertas de Prometheus para el runbook 04-outbox-backlog-creciente.
+# Métricas definidas en observability/instrumentation.md (sección Outbox). Las publica el propio
+# oms-outbox-relay en cada tick (SDK de OpenTelemetry → Managed Prometheus).
+#
+# Diseño:
+#   - Es una degradación SILENCIOSA: ningún SLO de usuario (5xx, latencia) la ve. Por eso se alerta
+#     sobre la edad del evento más antiguo, que es lo que vive el cliente (FR-014: email en < 5 min).
+#   - critical a 300 s durante 5 min → PagerDuty: con 300 s ya se ha consumido el presupuesto
+#     entero de FR-014 para ese pedido.
+#   - warning a 60 s durante 10 min, o cola creciendo de forma sostenida → Slack: el relay se queda
+#     atrás, pero todavía hay margen. El objetivo normal es < 1 s (tick de 500 ms).
+#   - OutboxRelayStalled: si el relay muere, sus gauges desaparecen y la alerta de edad NO
+#     dispararía nunca. Por eso esta usa absent() además del timestamp del último tick correcto.
+#   - OutboxHandlerFailing: ratio por handler con mínimo de invocaciones (de noche hay ~2 pedidos/h
+#     y un único fallo sería el 50 %).
+#   - V3: cuarentena automática (dead letter) y automatizador de flags vigilados.
+#
+# Inhibiciones (alertmanager.yml): OutboxBacklogGrowing{severity="critical"} inhibe a su warning;
+# OutboxRelayStalled inhibe a OutboxBacklogGrowing; PostgresUnavailable (runbook 09) inhibe a todo
+# el grupo, porque sin BD el backlog es un síntoma.
+
+groups:
+  - name: outbox
+    interval: 30s
+    rules:
+
+      - alert: OutboxBacklogGrowing
+        expr: |
+          max(outbox_oldest_pending_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-outbox-relay
+          runbook: "04-outbox-backlog-creciente"
+        annotations:
+          summary: "Outbox: el evento más antiguo lleva {{ $value | humanizeDuration }} sin publicarse (FR-014 incumplido)"
+          description: |
+            El evento pendiente más antiguo de outbox.events tiene {{ $value | humanizeDuration }} (umbral 5 min).
+            Los emails de confirmación, las facturas y la transición PENDING → CONFIRMED llevan retraso.
+            El checkout sigue funcionando: los SLOs de Orders NO lo reflejan.
+            Primer paso: diagnóstico 0 del runbook (¿relay parado, handler caído o throughput?).
+          runbook_url: "https://runbooks.example.com/04-outbox-backlog-creciente?oldest_age_s={{ $value | printf \"%.0f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-outbox?from=now-3h&to=now"
+
+      - alert: OutboxBacklogGrowing
+        expr: |
+          max(outbox_oldest_pending_age_seconds) > 60
+          or
+          (
+            deriv(sum(outbox_pending_events)[15m:1m]) > 0
+            and
+            sum(outbox_pending_events) > 50
+          )
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-outbox-relay
+          runbook: "04-outbox-backlog-creciente"
+        annotations:
+          summary: "Outbox: el relay se queda atrás (valor {{ $value | printf \"%.0f\" }})"
+          description: |
+            Durante 10 min, el evento más antiguo supera 60 s o la cola de outbox.events crece de forma
+            sostenida con más de 50 pendientes (valor: {{ $value | printf "%.1f" }}: segundos de edad o
+            eventos/s de crecimiento). Aún no se incumple FR-014.
+            Revisa fallos por handler (diagnóstico 3) antes de que pase a critical.
+          runbook_url: "https://runbooks.example.com/04-outbox-backlog-creciente?value={{ $value | printf \"%.1f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-outbox?from=now-3h&to=now"
+
+      - alert: OutboxRelayStalled
+        expr: |
+          (time() - max(outbox_relay_last_success_timestamp_seconds)) > 120
+          or
+          absent(outbox_relay_last_success_timestamp_seconds)
+        for: 2m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-outbox-relay
+          runbook: "04-outbox-backlog-creciente"
+        annotations:
+          summary: "Outbox relay parado: {{ $value | printf \"%.0f\" }} s sin un ciclo correcto"
+          description: |
+            Ninguna instancia de oms-outbox-relay completa un tick desde hace {{ $value | printf "%.0f" }} s
+            (valor 1 = la métrica ha desaparecido: no hay instancias vivas o no exportan).
+            Mientras dure, no sale ningún evento: ni emails, ni facturas, ni confirmaciones de pedido.
+            Primer paso: diagnóstico 1 (revisión, estado y logs del relay).
+          runbook_url: "https://runbooks.example.com/04-outbox-backlog-creciente?trigger=relay-stalled&stalled_s={{ $value | printf \"%.0f\" }}&severity=critical#1-el-relay-está-vivo-y-en-qué-revisión"
+          dashboard_url: "https://grafana.example.com/d/oms-outbox?viewPanel=relay-health&from=now-1h"
+
+      - alert: OutboxHandlerFailing
+        expr: |
+          (
+            sum by (handler) (rate(outbox_publish_failures_total[10m]))
+            /
+            sum by (handler) (rate(outbox_handler_duration_seconds_count[10m]))
+          ) > 0.20
+          and
+          sum by (handler) (increase(outbox_handler_duration_seconds_count[10m])) >= 10
+        for: 10m
+        labels:
+          severity: warning
+          team: orders
+          service: oms-outbox-relay
+          runbook: "04-outbox-backlog-creciente"
+        annotations:
+          summary: "Handler {{ $labels.handler }} falla en el {{ $value | humanizePercentage }} de las invocaciones"
+          description: |
+            El handler {{ $labels.handler }} del outbox falla en el {{ $value | humanizePercentage }} de sus
+            invocaciones de los últimos 10 min. Sus eventos se reintentan con backoff y, tras 10 intentos,
+            van a cuarentena. Causa habitual: dependencia externa (proveedor de email, servicio de sellado
+            del PDF). Si es billing.generate-invoice, el automatizador V3 enciende billing.pdf-generation-paused.
+          runbook_url: "https://runbooks.example.com/04-outbox-backlog-creciente?handler={{ $labels.handler }}&failure_ratio={{ $value | printf \"%.2f\" }}#3-qué-handler-falla-y-por-qué"
+          dashboard_url: "https://grafana.example.com/d/oms-outbox?viewPanel=failures-by-handler&var-handler={{ $labels.handler }}"
+
+      # V3: el relay mueve a outbox.dead_letter los eventos que agotan 10 intentos.
+      # Sin esta alerta, la cuarentena sería un cementerio silencioso de facturas.
+      - alert: OutboxDeadLetterNotEmpty
+        expr: |
+          max(outbox_dead_letter_events) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: orders
+          service: oms-outbox-relay
+          runbook: "04-outbox-backlog-creciente"
+        annotations:
+          summary: "{{ $value }} evento(s) en cuarentena en outbox.dead_letter"
+          description: |
+            Hay {{ $value }} evento(s) que agotaron sus reintentos y están en outbox.dead_letter.
+            Cada uno es un email, una factura o una confirmación que no saldrá hasta que alguien lo
+            reencole. No es urgente de madrugada: se revisa en horario laboral (diagnóstico 4 y rollback
+            de la Acción 1).
+          runbook_url: "https://runbooks.example.com/04-outbox-backlog-creciente?trigger=dead-letter&count={{ $value }}#4-hay-poison-messages"
+          dashboard_url: "https://grafana.example.com/d/oms-outbox?viewPanel=dead-letter"

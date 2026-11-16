@@ -1,0 +1,254 @@
+# Alertas de Prometheus para el runbook 03-stripe-payment-gateway-degraded.
+# Métricas definidas en observability/instrumentation.md (módulo Payments). Las emite el adapter
+# StripePaymentGateway (ADR-006) con el SDK de OpenTelemetry del monolito.
+#
+# Diseño:
+#   - Solo cuentan como fallo outcome=~"api_error|timeout". card_error es un rechazo legítimo del
+#     emisor (respuesta definitiva y correcta): no es culpa de Stripe ni nuestra y nunca dispara.
+#   - critical a 5 % de errores o p95 > 2,5 s durante 5 min. 2,5 s es el timeout por llamada:
+#     un p95 ahí significa que ~5 % de las llamadas ya están en timeout o rozándolo, y el SLO de
+#     Payments exige respuesta en < 3 s.
+#   - Tráfico bajo (~90 autorizaciones/h de media, ~15/5 min en punta): se exige un mínimo de
+#     llamadas y de fallos para que 1 error aislado de madrugada (1 de 8 = 12 %) no despierte a nadie.
+#   - Dos reglas con el mismo nombre y etiqueta `signal` (errors | latency): así {{ $value }} siempre
+#     es un número con sentido (ratio o segundos), no una mezcla.
+#   - Con el breaker forzado no hay llamadas a Stripe y StripeGatewayDegraded se resuelve sola. Por eso
+#     la recuperación se verifica con el flag en OFF (runbook, "Verificación") y con probe stripe-api.
+
+groups:
+  - name: payments-stripe
+    interval: 30s
+    rules:
+
+      - alert: StripeGatewayDegraded
+        expr: |
+          (
+            sum(rate(payment_provider_requests_total{provider="stripe", outcome=~"api_error|timeout"}[5m]))
+            /
+            sum(rate(payment_provider_requests_total{provider="stripe"}[5m]))
+          ) > 0.05
+          and on()
+          sum(increase(payment_provider_requests_total{provider="stripe"}[10m])) >= 10
+          and on()
+          sum(increase(payment_provider_requests_total{provider="stripe", outcome=~"api_error|timeout"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: critical
+          team: payments
+          service: oms-orders-api
+          signal: errors
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "Stripe con {{ $value | humanizePercentage }} de errores (api_error|timeout)"
+          description: |
+            El {{ $value | humanizePercentage }} de las llamadas de oms-orders a Stripe acaban en api_error o timeout
+            (umbral 5 %, card_error excluido) desde hace más de 5 min. Con el breaker cerrado, el cliente ve
+            "no hemos podido procesar tu pago" (502). Primer paso: diagnóstico 0 y, si hay 5xx, Acción 1
+            (flag payments.stripe-circuit-force-open).
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?signal=errors&value={{ $value | printf \"%.3f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=stripe-outcome-ratio&from=now-1h&to=now"
+
+      - alert: StripeGatewayDegraded
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(payment_provider_request_duration_seconds_bucket{provider="stripe"}[5m]))
+          ) > 2.5
+          and on()
+          sum(increase(payment_provider_requests_total{provider="stripe"}[10m])) >= 20
+        for: 5m
+        labels:
+          severity: critical
+          team: payments
+          service: oms-orders-api
+          signal: latency
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "Stripe lento: p95 {{ $value | printf \"%.2f\" }} s (umbral 2,5 s)"
+          description: |
+            El p95 de las llamadas a Stripe es {{ $value | printf "%.2f" }} s desde hace más de 5 min. El timeout
+            por llamada es 2,5 s: los timeouts ya están subiendo y el SLO de Payments (< 3 s) se está quemando.
+            NO actives payments.stripe-fast-retry (empeora con latencia). Diagnóstico 2: ¿Stripe o nuestra red?
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?signal=latency&value={{ $value | printf \"%.2f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=stripe-p95&from=now-1h&to=now"
+
+      - alert: StripeGatewayErrorsElevated
+        expr: |
+          (
+            (
+              sum(rate(payment_provider_requests_total{provider="stripe", outcome=~"api_error|timeout"}[15m]))
+              /
+              sum(rate(payment_provider_requests_total{provider="stripe"}[15m]))
+            ) > 0.02
+            and on()
+            sum(increase(payment_provider_requests_total{provider="stripe", outcome=~"api_error|timeout"}[15m])) >= 3
+          )
+          or on()
+          (
+            histogram_quantile(0.95,
+              sum by (le) (rate(payment_provider_request_duration_seconds_bucket{provider="stripe"}[15m]))
+            ) > 1.5
+            and on()
+            sum(increase(payment_provider_requests_total{provider="stripe"}[15m])) >= 20
+          )
+        for: 10m
+        labels:
+          severity: warning
+          team: payments
+          service: oms-orders-api
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "Stripe empeorando (valor {{ $value | printf \"%.3f\" }}: ratio de error o p95 en s)"
+          description: |
+            Las llamadas a Stripe llevan 10 min con > 2 % de api_error|timeout o p95 > 1,5 s (valor: {{ $value | printf "%.3f" }}).
+            Todavía sin impacto relevante para el cliente. Mira status.stripe.com y el diagnóstico 1
+            (tipo de error). Si es un 401 o un 429, la causa es nuestra y conviene atajarla en horario laboral.
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?signal=early&value={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?from=now-3h&to=now"
+
+      - alert: StripeCircuitOpen
+        expr: |
+          count(circuit_breaker_state{breaker="stripe"} == 2) > 0
+        for: 1m
+        labels:
+          severity: info
+          team: payments
+          service: oms-orders-api
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "Circuit breaker de Stripe abierto en {{ $value }} instancia(s) de oms-orders"
+          description: |
+            {{ $value }} instancia(s) de oms-orders tienen el breaker de Stripe abierto (automático o forzado con
+            payments.stripe-circuit-force-open). Los pedidos se aceptan como PENDING_PAYMENT (HTTP 202) y el
+            cobro va a la cola de reintentos. No es un 5xx para Orders, pero sí quema budget de Payments.
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?section=breaker&instances_open={{ $value }}"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=breaker-por-instancia"
+
+      # La cola debe drenar cuando el breaker está cerrado. Si lleva 30 min cerrado y la cola no baja,
+      # el worker payment-retry (oms-outbox-relay) está parado o alguien dejó payments.retry-queue-paused en ON.
+      - alert: PaymentRetryQueueStuck
+        expr: |
+          max(payment_retry_queue_depth) > 0
+          and on()
+          deriv(max(payment_retry_queue_depth)[30m:1m]) >= 0
+          and on()
+          max(max_over_time(circuit_breaker_state{breaker="stripe"}[30m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+          team: payments
+          service: oms-outbox-relay
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "Cola de reintentos de pago atascada: {{ $value }} cobros pendientes"
+          description: |
+            payment_retry_queue_depth = {{ $value }} y no baja desde hace 45 min, con el breaker de Stripe cerrado.
+            Son clientes con pedido en PENDING_PAYMENT esperando el email de confirmación; caducan a las 20 h.
+            Comprueba payments.retry-queue-paused y los logs del worker (diagnóstico 6).
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?section=diagnostico-6&queue_depth={{ $value }}"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=retry-queue&from=now-3h&to=now"
+
+      # V3: el controlador oms-ops-stripe-breaker (Cloud Scheduler cada minuto → Cloud Run Job) fuerza y cierra
+      # el breaker. Si deja de ejecutarse, volvemos a depender de que el on-call lo haga a mano.
+      - alert: StripeBreakerControllerStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="stripe-breaker-controller"}) > 600
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="stripe-breaker-controller"})
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "El controlador del breaker de Stripe lleva > 10 min sin ejecutarse"
+          description: |
+            oms-ops-stripe-breaker no publica ejecución correcta desde hace > 10 min. Si Stripe se degrada ahora,
+            nadie forzará el breaker automáticamente: aplica el runbook a mano (Acción 1). Revisa el job
+            y el scheduler oms-ops-stripe-breaker.
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?section=automatizacion&job=stripe-breaker-controller"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=ops-jobs"
+
+  # ─── Burn rate del SLO de Payments (99,0 %, 28 d) ───
+  # SLI: intentos de autorización con respuesta definitiva (approved | declined) en < 3 s / intentos válidos.
+  # queued (breaker abierto) y failed cuentan como malos. Solo cuenta el intento síncrono del cliente:
+  # los reintentos desde la cola no vuelven a sumar en payment_authorizations_total.
+  # Error budget = 1 − 0,990 = 0,01 (≈ 616 intentos en 28 d con ~2.200 intentos/día).
+  #   rápida: 14,4× en 1 h (confirmada en 5 min) → 2 % del budget en 1 h
+  #   lenta:   6×   en 6 h (confirmada en 30 min) → 5 % del budget en 6 h
+  # Requiere que payment_authorization_duration_seconds_bucket lleve la etiqueta outcome y un bucket le="3".
+  - name: payments-slo-burn-rate
+    interval: 30s
+    rules:
+
+      - record: slo:payments_auth_bad:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(payment_authorization_duration_seconds_bucket{le="3", outcome=~"approved|declined", synthetic!="true"}[5m]))
+            / sum(rate(payment_authorization_duration_seconds_count{outcome!~"invalid_request|requires_action", synthetic!="true"}[5m]))
+          )
+      - record: slo:payments_auth_bad:ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(payment_authorization_duration_seconds_bucket{le="3", outcome=~"approved|declined", synthetic!="true"}[30m]))
+            / sum(rate(payment_authorization_duration_seconds_count{outcome!~"invalid_request|requires_action", synthetic!="true"}[30m]))
+          )
+      - record: slo:payments_auth_bad:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(payment_authorization_duration_seconds_bucket{le="3", outcome=~"approved|declined", synthetic!="true"}[1h]))
+            / sum(rate(payment_authorization_duration_seconds_count{outcome!~"invalid_request|requires_action", synthetic!="true"}[1h]))
+          )
+      - record: slo:payments_auth_bad:ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(payment_authorization_duration_seconds_bucket{le="3", outcome=~"approved|declined", synthetic!="true"}[6h]))
+            / sum(rate(payment_authorization_duration_seconds_count{outcome!~"invalid_request|requires_action", synthetic!="true"}[6h]))
+          )
+
+      - alert: PaymentsAuthBurnRateFast
+        expr: |
+          slo:payments_auth_bad:ratio_rate1h > (14.4 * 0.01)
+          and
+          slo:payments_auth_bad:ratio_rate5m > (14.4 * 0.01)
+          and
+          sum(increase(payment_authorizations_total[1h])) > 20
+        for: 2m
+        labels:
+          severity: critical
+          team: payments
+          service: oms-orders-api
+          slo: payments-authorization
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "SLO Payments: {{ $value | humanizePercentage }} de autorizaciones malas en 1 h (×14,4)"
+          description: |
+            El {{ $value | humanizePercentage }} de los intentos de autorización de la última hora no tuvo respuesta
+            definitiva en < 3 s. A este ritmo se va el 2 % del budget mensual de Payments cada hora.
+            Si el breaker está forzado es lo esperado (PENDING_PAYMENT cuenta como malo): confirma que la
+            causa es Stripe y vigila la duración. Si no lo está, empieza por el diagnóstico 0.
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?trigger=burn-rate-fast&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=slo-payments"
+
+      - alert: PaymentsAuthBurnRateSlow
+        expr: |
+          slo:payments_auth_bad:ratio_rate6h > (6 * 0.01)
+          and
+          slo:payments_auth_bad:ratio_rate30m > (6 * 0.01)
+          and
+          sum(increase(payment_authorizations_total[6h])) > 100
+        for: 15m
+        labels:
+          severity: critical
+          team: payments
+          service: oms-orders-api
+          slo: payments-authorization
+          runbook: "03-stripe-payment-gateway-degraded"
+        annotations:
+          summary: "SLO Payments: degradación sostenida, {{ $value | humanizePercentage }} malas en 6 h (×6)"
+          description: |
+            6 h con un {{ $value | humanizePercentage }} de autorizaciones sin respuesta definitiva en < 3 s.
+            Se consume el 5 % del budget cada 6 h. Suele ser Stripe lento de forma intermitente (p95 cerca de
+            2,5 s sin llegar a disparar StripeGatewayDegraded) o un breaker forzado que alguien olvidó cerrar.
+          runbook_url: "https://runbooks.example.com/03-stripe-payment-gateway-degraded?trigger=burn-rate-slow&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-payments?viewPanel=slo-payments&from=now-24h"

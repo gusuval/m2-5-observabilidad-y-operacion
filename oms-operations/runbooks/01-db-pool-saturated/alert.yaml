@@ -1,34 +1,161 @@
-# Alerta de Prometheus para el runbook db-pool-saturated.
-# TODO(alumno): completar los TODO. La alerta debe disparar antes del 100%
-# para dar margen de respuesta antes del impacto al usuario.
+# Alertas de Prometheus para el runbook 01-db-pool-saturated.
+# Métricas definidas en observability/instrumentation.md (pool del cliente pg / HikariCP
+# exportado por el SDK de OpenTelemetry del monolito).
+#
+# Diseño:
+#   - warning a 75 % (10 min) → Slack: avisa con margen, sin despertar a nadie.
+#   - critical a 90 % (3 min) → PagerDuty: dispara antes del 100 %, porque con el 100 %
+#     las peticiones ya esperan DB_POOL_ACQUIRE_TIMEOUT (2 s) y fallan con 503.
+#   - burn rate del SLO de Orders: dispara por impacto en el usuario aunque la causa
+#     no sea el pool (es la red de seguridad de este y del resto de runbooks).
 
 groups:
-  - name: orders-db
+  - name: orders-db-pool
     interval: 30s
     rules:
 
       - alert: DBConnectionPoolSaturated
         expr: |
-          # TODO PromQL. Pista: db_pool_in_use / db_pool_size > 0.9
-          # Si tu pool no está instrumentado, define qué métrica usarías
-          # y déjalo documentado en observability/instrumentation.md
-          TODO_PROMQL_AQUI
+          max by (job, instance) (
+            db_pool_in_use{job=~"oms-orders|oms-catalog|oms-outbox-relay"}
+            /
+            db_pool_size{job=~"oms-orders|oms-catalog|oms-outbox-relay"}
+          ) > 0.9
         for: 3m
         labels:
           severity: critical
           team: orders
           service: oms-orders-api
+          runbook: "01-db-pool-saturated"
         annotations:
-          summary: "Cloud SQL pool saturado en {{ $labels.instance }}"
+          summary: "Pool de BD al {{ $value | humanizePercentage }} en {{ $labels.job }}/{{ $labels.instance }}"
           description: |
-            Pool de conexiones al {{ $value | humanizePercentage }} durante >3 min
-            en {{ $labels.instance }}. Si llega al 100%, las nuevas conexiones
-            empezarán a fallar.
-          runbook_url: "https://runbooks.example.com/db-pool-saturated?instance={{ $labels.instance }}&value={{ $value }}&service={{ $labels.service }}"
-          dashboard_url: "https://grafana.example.com/d/oms-db-overview?var-instance={{ $labels.instance }}"
+            El pool de conexiones a Cloud SQL (oms-pg-prod) de {{ $labels.job }}, instancia
+            {{ $labels.instance }}, está al {{ $value | humanizePercentage }} (umbral 90 %) desde hace más de 3 min.
+            Al 100 % las peticiones esperan 2 s y fallan con 503: el checkout empieza a fallar.
+            Primer paso: diagnóstico 1 del runbook (¿quién consume las conexiones?).
+          runbook_url: "https://runbooks.example.com/01-db-pool-saturated?job={{ $labels.job }}&instance={{ $labels.instance }}&value={{ $value | printf \"%.2f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?var-job={{ $labels.job }}&var-instance={{ $labels.instance }}&from=now-1h&to=now"
 
-# ─── BONUS: alerta de "burn rate" sobre el SLO ───────────────────
-# Si tu SLO de orders es "99,5% de POST /orders no-5xx en 28d", una
-# alerta de burn rate dispara antes de que el SLO se viole de verdad.
-# TODO(alumno): si quieres puntos extra, añade aquí la alerta de burn rate
-# que vimos en el Vídeo 2 del bloque.
+      - alert: DBConnectionPoolPressure
+        expr: |
+          (
+            max by (job, instance) (db_pool_in_use / db_pool_size) > 0.75
+          )
+          or
+          (
+            max by (job, instance) (db_pool_pending_acquires) > 0
+          )
+        for: 10m
+        labels:
+          severity: warning
+          team: orders
+          service: oms-orders-api
+          runbook: "01-db-pool-saturated"
+        annotations:
+          summary: "Presión en el pool de BD de {{ $labels.job }}/{{ $labels.instance }}"
+          description: |
+            {{ $labels.job }}/{{ $labels.instance }} lleva 10 min con el pool por encima del 75 % o con
+            peticiones esperando conexión (valor actual: {{ $value }}).
+            Todavía no hay impacto en el usuario. Revisa en horario laboral si hay un job batch
+            o sesiones zombi (diagnóstico 1 y 2) antes de que escale a critical.
+          runbook_url: "https://runbooks.example.com/01-db-pool-saturated?job={{ $labels.job }}&instance={{ $labels.instance }}&value={{ $value | printf \"%.2f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?var-job={{ $labels.job }}&var-instance={{ $labels.instance }}"
+
+      # V3: el cron preventivo kill-idle-connections tiene que ejecutarse cada hora.
+      # Si deja de hacerlo, volvemos al escenario de V1 sin que nadie se entere.
+      - alert: KillIdleConnectionsCronStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="kill-idle-connections"}) > 3 * 3600
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="kill-idle-connections"})
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "01-db-pool-saturated"
+        annotations:
+          summary: "El cron kill-idle-connections no se ejecuta con éxito desde hace > 3 h"
+          description: |
+            La automatización preventiva del runbook 01 (scripts/db-pool-saturated.sh, Cloud Scheduler
+            cada hora) lleva más de 3 h sin éxito. Sin ella, las sesiones zombi del bug OMS-1234
+            vuelven a acumularse. Revisa los logs del job oms-ops-kill-idle.
+          runbook_url: "https://runbooks.example.com/01-db-pool-saturated?section=automatizacion&job=kill-idle-connections"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=ops-jobs"
+
+  # ─── Burn rate del SLO 1 de Orders (99,9 % no-5xx en POST /api/orders, 28 d) ───
+  # Multiwindow multi-burn-rate (Vídeo 2 / SRE Workbook):
+  #   rápida: 14,4× en 1 h (y 5 min para confirmar que sigue ocurriendo) → 2 % del budget en 1 h → page
+  #   lenta:   6×   en 6 h (y 30 min)                                     → 5 % del budget en 6 h → page
+  # Error budget = 1 − 0,999 = 0,001.
+  # Tráfico bajo (~100 POST/h): se exige un mínimo de peticiones para que 1 error aislado
+  # (1 % de 100) no dispare por sí solo una alerta de 10× burn rate.
+  - name: orders-slo-burn-rate
+    interval: 30s
+    rules:
+
+      - record: slo:orders_post_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[5m]))
+      - record: slo:orders_post_errors:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[30m]))
+          /
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[30m]))
+      - record: slo:orders_post_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[1h]))
+          /
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[1h]))
+      - record: slo:orders_post_errors:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[6h]))
+          /
+          sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[6h]))
+
+      - alert: OrdersAvailabilityBurnRateFast
+        expr: |
+          slo:orders_post_errors:ratio_rate1h > (14.4 * 0.001)
+          and
+          slo:orders_post_errors:ratio_rate5m > (14.4 * 0.001)
+          and
+          sum(increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[1h])) > 20
+        for: 2m
+        labels:
+          severity: critical
+          team: orders
+          service: oms-orders-api
+          slo: orders-availability
+        annotations:
+          summary: "SLO Orders: quemando budget a {{ $value | humanizePercentage }} de errores (×14,4 en 1 h)"
+          description: |
+            POST /api/orders tiene un ratio de 5xx de {{ $value | humanizePercentage }} en la última hora.
+            A este ritmo se consume el 2 % del error budget mensual (40 min) cada hora.
+            Triage: runbook 10-checkout-unavailable (árbol de decisión hacia 01, 03, 07 y 09).
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?trigger=burn-rate-fast&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=slo-orders"
+
+      - alert: OrdersAvailabilityBurnRateSlow
+        expr: |
+          slo:orders_post_errors:ratio_rate6h > (6 * 0.001)
+          and
+          slo:orders_post_errors:ratio_rate30m > (6 * 0.001)
+          and
+          sum(increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[6h])) > 100
+        for: 15m
+        labels:
+          severity: critical
+          team: orders
+          service: oms-orders-api
+          slo: orders-availability
+        annotations:
+          summary: "SLO Orders: degradación sostenida, {{ $value | humanizePercentage }} de 5xx en 6 h (×6)"
+          description: |
+            POST /api/orders lleva 6 h con un ratio de 5xx de {{ $value | humanizePercentage }}.
+            A este ritmo se consume el 5 % del budget cada 6 h y se agota en < 5 días.
+            No es un pico: es una degradación lenta (pool, Stripe intermitente, revisión defectuosa).
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?trigger=burn-rate-slow&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=slo-orders&from=now-24h"

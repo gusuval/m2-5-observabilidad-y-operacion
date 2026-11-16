@@ -1,0 +1,41 @@
+# Alertas de salud de la automatización COMPARTIDA entre runbooks.
+#
+# oms-ops-flag-automator (Cloud Run, europe-west3) recibe los webhooks de Alertmanager por la ruta
+# `automation` y enciende o apaga feature flags en Unleash según automator-rules.yaml. Es la pieza V3
+# de los runbooks 02, 04, 05, 08, 09, 11 y 12. Si muere en silencio, todas esas mitigaciones
+# automáticas dejan de aplicarse a la vez. Por eso tiene UNA alerta canónica aquí y no una copia
+# por runbook (antes había tres variantes con umbrales distintos).
+#
+# Latido: Cloud Scheduler `oms-ops-flag-automator-selftest` (*/5 * * * *) llama a /selftest, que
+# simula una alerta contra el Unleash de staging y comprueba que la regla se aplicaría. Si va bien,
+# publica ops_job_last_success_timestamp_seconds{job="flag-automator"}.
+#
+# Las automatizaciones propias de cada runbook (kill-idle-connections, canary-analysis,
+# stripe-breaker-controller, db-housekeeping, …) se vigilan en el alert.yaml de su runbook.
+
+groups:
+  - name: ops-automation-shared
+    interval: 60s
+    rules:
+      - alert: FlagAutomatorStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="flag-automator"}) > 900
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="flag-automator"})
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "automatizaciones-compartidas"
+        annotations:
+          summary: "oms-ops-flag-automator sin latido desde hace > 15 min"
+          description: |
+            El self-test de oms-ops-flag-automator no termina con éxito desde hace más de 15 min
+            (3 ejecuciones seguidas fallidas). Mientras no se arregle, las mitigaciones automáticas
+            NO se aplican: SearchLatencyHigh (02), pausa de PDF del outbox (04), bypass de Redis (05, 08),
+            página de mantenimiento (09), serve-stale (11) y throttling de CPU (12).
+            El on-call las ejecuta a mano siguiendo la Acción 1 de cada runbook.
+            Revisa los logs del servicio Cloud Run oms-ops-flag-automator y la validez del token de Unleash.
+          runbook_url: "https://runbooks.example.com/automatizaciones-compartidas?job=flag-automator&value={{ $value | printf \"%.0f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=ops-automation"

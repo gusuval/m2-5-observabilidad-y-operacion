@@ -1,0 +1,134 @@
+# Alertas de Prometheus para el runbook 07-canary-rollout-failed.
+# Métricas: http_requests_total y http_request_duration_seconds_bucket con la etiqueta `revision`
+# (observability/instrumentation.md) + run_revision_traffic_percent{job, revision, tag}, que el
+# stackdriver_exporter genera a partir de status.traffic[] de cada servicio de Cloud Run (cada 30 s).
+#
+# Diseño:
+#   - Se compara la revisión con tag `canary` contra la revisión con tag `stable` DEL MISMO SERVICIO,
+#     no contra el total del servicio: con la canary al 50 %, el total ya incluye la canary y diluye la diferencia.
+#   - Errores: canary > 2× estable Y > 1 %. El doble solo no basta (0,2 % frente a 0,1 % es ruido);
+#     el 1 % solo tampoco (si la estable también está al 1 %, el problema no es la release → runbook 02/10).
+#   - Latencia: p95 canary > 1,5× estable Y > 250 ms (NFR-PERF-002).
+#   - Mínimo de 100 peticiones en 10 min en la canary: con el 10 % del tráfico a primera hora,
+#     3 errores serían un 3 % y la alerta pararía releases sanas.
+#   - for: 5m. El job canary-analysis del pipeline (V3) decide antes, con 3 chequeos malos seguidos
+#     (3 min), y revierte solo. Esta alerta es la red de seguridad si el job no está o no ha actuado.
+#   - El pipeline quita el tag `canary` en promote-100 (--remove-tags canary); si quedara, el filtro
+#     `> 0` sobre el porcentaje evita compararla consigo misma.
+
+groups:
+  - name: canary-recording
+    interval: 30s
+    rules:
+      # `or ... * 0` para que una revisión sin 5xx tenga ratio 0 y no desaparezca de la comparación.
+      - record: revision:http_errors:ratio_rate5m
+        expr: |
+          (
+            sum by (job, revision) (rate(http_requests_total{job=~"oms-catalog|oms-orders", code=~"5.."}[5m]))
+            or
+            sum by (job, revision) (rate(http_requests_total{job=~"oms-catalog|oms-orders"}[5m])) * 0
+          )
+          /
+          sum by (job, revision) (rate(http_requests_total{job=~"oms-catalog|oms-orders"}[5m]))
+      - record: revision:http_latency:p95_5m
+        expr: |
+          histogram_quantile(0.95, sum by (le, job, revision) (rate(http_request_duration_seconds_bucket{job=~"oms-catalog|oms-orders"}[5m])))
+      - record: revision:http_requests:increase10m
+        expr: |
+          sum by (job, revision) (increase(http_requests_total{job=~"oms-catalog|oms-orders"}[10m]))
+
+  - name: canary-rollout
+    interval: 30s
+    rules:
+
+      - alert: CanaryRolloutFailed
+        expr: |
+          (revision:http_errors:ratio_rate5m and on (job, revision) (run_revision_traffic_percent{tag="canary"} > 0))
+            > on (job) group_left ()
+          (2 * max by (job) (revision:http_errors:ratio_rate5m and on (job, revision) run_revision_traffic_percent{tag="stable"}))
+          and revision:http_errors:ratio_rate5m > 0.01
+          and on (job, revision) revision:http_requests:increase10m >= 100
+        for: 5m
+        labels:
+          severity: critical
+          team: sre
+          service: "{{ $labels.job }}"
+          reason: errors
+          runbook: "07-canary-rollout-failed"
+        annotations:
+          summary: "Canary {{ $labels.revision }} de {{ $labels.job }} con {{ $value | humanizePercentage }} de 5xx (> 2× la estable)"
+          description: |
+            La revisión canary {{ $labels.revision }} de {{ $labels.job }} devuelve {{ $value | humanizePercentage }} de 5xx
+            desde hace 5 min, más del doble que la revisión stable y por encima del 1 %.
+            Acción estándar: Acción 2 (todo el tráfico a la estable + cancelar el pipeline). Primero revertir, después investigar.
+          runbook_url: "https://runbooks.example.com/07-canary-rollout-failed?job={{ $labels.job }}&canary={{ $labels.revision }}&reason=errors&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-deploys?viewPanel=canary-vs-stable&var-job={{ $labels.job }}&var-revision={{ $labels.revision }}&from=now-1h&to=now"
+
+      - alert: CanaryRolloutFailed
+        expr: |
+          (revision:http_latency:p95_5m and on (job, revision) (run_revision_traffic_percent{tag="canary"} > 0))
+            > on (job) group_left ()
+          (1.5 * max by (job) (revision:http_latency:p95_5m and on (job, revision) run_revision_traffic_percent{tag="stable"}))
+          and revision:http_latency:p95_5m > 0.25
+          and on (job, revision) revision:http_requests:increase10m >= 100
+        for: 5m
+        labels:
+          severity: critical
+          team: sre
+          service: "{{ $labels.job }}"
+          reason: latency
+          runbook: "07-canary-rollout-failed"
+        annotations:
+          summary: "Canary {{ $labels.revision }} de {{ $labels.job }} lenta: p95 {{ $value | humanizeDuration }} (> 1,5× la estable)"
+          description: |
+            El p95 de la revisión canary {{ $labels.revision }} de {{ $labels.job }} es {{ $value | humanizeDuration }},
+            más de 1,5 veces el de la estable y por encima de 250 ms, desde hace 5 min. Sin errores no deja de ser
+            una regresión: consume el SLO 2. Diagnóstico 3 (qué endpoint) y Acción 2.
+          runbook_url: "https://runbooks.example.com/07-canary-rollout-failed?job={{ $labels.job }}&canary={{ $labels.revision }}&reason=latency&p95={{ $value | printf \"%.3f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-deploys?viewPanel=canary-vs-stable&var-job={{ $labels.job }}&var-revision={{ $labels.revision }}&from=now-1h&to=now"
+
+      - alert: CanaryRolloutStuck
+        expr: |
+          max by (job, revision) (run_revision_traffic_percent{tag="canary"}) > 0 < 100
+        for: 2h
+        labels:
+          severity: warning
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "07-canary-rollout-failed"
+        annotations:
+          summary: "Canary {{ $labels.revision }} de {{ $labels.job }} lleva > 2 h con el {{ $value }} % del tráfico"
+          description: |
+            Un rollout por etapas no debería durar más de 30 min. La canary {{ $labels.revision }} lleva 2 h con tráfico
+            parcial: el pipeline murió a mitad o alguien lo dejó parado. Decide en horario: promocionar con el
+            pipeline o Acción 2. No la dejes así al cerrar la ventana OPS-002 (18:00).
+          runbook_url: "https://runbooks.example.com/07-canary-rollout-failed?job={{ $labels.job }}&canary={{ $labels.revision }}&reason=stuck&percent={{ $value }}"
+          dashboard_url: "https://grafana.example.com/d/oms-deploys?var-job={{ $labels.job }}"
+
+  # ─── V3: el auto-rollback también se vigila ───
+  - name: canary-automation
+    interval: 60s
+    rules:
+      - alert: CanaryAnalysisNotRunning
+        expr: |
+          (max by (job, revision) (run_revision_traffic_percent{tag="canary"}) > 0 < 100)
+          and on ()
+          (
+            (time() - max(ops_job_last_success_timestamp_seconds{job="canary-analysis"}) > 300)
+            or
+            absent(ops_job_last_success_timestamp_seconds{job="canary-analysis"})
+          )
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "07-canary-rollout-failed"
+        annotations:
+          summary: "Canary {{ $labels.revision }} con tráfico y sin canary-analysis vigilándola"
+          description: |
+            {{ $labels.job }} tiene la canary {{ $labels.revision }} con el {{ $value }} % del tráfico, pero el job
+            canary-analysis no publica latido desde hace > 5 min. Si la canary falla, nadie la revertirá
+            automáticamente. Comprueba el pipeline (diagnóstico 1) o termina el rollout a mano.
+          runbook_url: "https://runbooks.example.com/07-canary-rollout-failed?section=automatizacion&job={{ $labels.job }}&canary={{ $labels.revision }}"
+          dashboard_url: "https://grafana.example.com/d/oms-deploys?viewPanel=canary-analysis"

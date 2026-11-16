@@ -1,0 +1,158 @@
+# Alertas de Prometheus para el runbook 11-catalog-unavailable.
+# Métricas: probe_success y probe_ssl_earliest_cert_expiry (blackbox_exporter en europe-west1,
+# probe "catalog-home": GET / + GET /api/products?page=1 cada 30 s), http_requests_total (app),
+# loadbalancer_backend_5xx_total y loadbalancer_requests_total (stackdriver_exporter, HTTPS LB).
+#
+# Diseño de umbrales (NFR-AVAIL-002: 99,95 % mensual ≈ 22 min/mes; 1 min caído = 4,5 % del budget):
+#   - Dos reglas critical con el MISMO nombre (CatalogUnavailable) y etiqueta `trigger`:
+#       · probe: 2 min (4 probes seguidas) fallando desde FUERA de la región primaria. Ve lo que
+#         la app no puede ver de sí misma: CDN, certificado, LB, DNS.
+#       · 5xx: > 2 % durante 3 min (app + 5xx generados por el LB cuando la app no responde, que
+#         la app no puede contar). Con un error budget de 0,05 %, un 2 % es un burn rate de ×40:
+#         a ese ritmo el budget mensual se acaba en ~18 h.
+#     Mínimo de 2 peticiones/s para que de madrugada 3 errores no paginen.
+#   - Burn rate lento (×6 en 6 h y 30 min) como warning: degradación sostenida sin caída.
+#   - Los 403 de Cloud Armor NO son 5xx: el SLI no los ve (PM #1). Alerta propia sobre el ratio de
+#     403 en el LB. Es warning porque un ataque bloqueado también la dispara.
+#   - Certificado y probe viva: si la probe muere, la regla probe nunca dispararía.
+
+groups:
+  - name: catalog-availability
+    interval: 30s
+    rules:
+
+      - record: catalog:http_5xx:ratio_rate5m
+        expr: |
+          (
+            sum(rate(http_requests_total{job="oms-catalog", code=~"5..", endpoint!="/healthz", synthetic!="true"}[5m]))
+            + (sum(rate(loadbalancer_backend_5xx_total{backend_service="oms-catalog"}[5m])) or vector(0))
+          )
+          /
+          (
+            sum(rate(http_requests_total{job="oms-catalog", endpoint!="/healthz", synthetic!="true"}[5m]))
+            + (sum(rate(loadbalancer_backend_5xx_total{backend_service="oms-catalog"}[5m])) or vector(0))
+          )
+
+      - alert: CatalogUnavailable
+        expr: |
+          max(probe_success{probe="catalog-home"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-catalog
+          trigger: probe
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "La probe catalog-home falla desde europe-west1 desde hace > 2 min"
+          description: |
+            La probe sintética (GET / + GET /api/products?page=1) lleva 2 min fallando desde fuera de la región primaria.
+            Los clientes probablemente no pueden ver la tienda. Cada minuto es el 4,5 % del budget mensual de NFR-AVAIL-002.
+            Empieza por el paso 0 del runbook (curl + openssl desde tu portátil) para localizar la capa.
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=probe&probe=catalog-home&value={{ $value }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=catalog-availability&from=now-1h&to=now"
+
+      - alert: CatalogUnavailable
+        expr: |
+          catalog:http_5xx:ratio_rate5m > 0.02
+          and
+          sum(rate(http_requests_total{job="oms-catalog", endpoint!="/healthz", synthetic!="true"}[5m])) > 2
+        for: 3m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-catalog
+          trigger: 5xx
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "Catálogo con {{ $value | humanizePercentage }} de 5xx (umbral 2 %)"
+          description: |
+            oms-catalog (app + Load Balancer) devuelve un {{ $value | humanizePercentage }} de 5xx desde hace 3 min.
+            Con un budget del 0,05 %, un 2 % de errores es un burn rate de ×40: mitiga primero (Acción 1) y diagnostica después.
+            Paso 1 del runbook: statusDetails del LB y 5xx por endpoint.
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=5xx&job=oms-catalog&value={{ $value | printf \"%.4f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=catalog-availability&var-job=oms-catalog&from=now-1h&to=now"
+
+      - alert: CatalogAvailabilityBurnRateSlow
+        expr: |
+          (
+            (sum(rate(http_requests_total{job="oms-catalog", code=~"5..", endpoint!="/healthz", synthetic!="true"}[6h]))
+             + (sum(rate(loadbalancer_backend_5xx_total{backend_service="oms-catalog"}[6h])) or vector(0)))
+            /
+            (sum(rate(http_requests_total{job="oms-catalog", endpoint!="/healthz", synthetic!="true"}[6h]))
+             + (sum(rate(loadbalancer_backend_5xx_total{backend_service="oms-catalog"}[6h])) or vector(0)))
+          ) > (6 * 0.0005)
+          and
+          catalog:http_5xx:ratio_rate5m > (6 * 0.0005)
+        for: 30m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-catalog
+          slo: catalog-availability
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "Catálogo: {{ $value | humanizePercentage }} de 5xx sostenido en 6 h (×6 del budget de 99,95 %)"
+          description: |
+            oms-catalog lleva 6 h con un {{ $value | humanizePercentage }} de 5xx. No es una caída, pero a este ritmo
+            se consume el 5 % del budget mensual de NFR-AVAIL-002 cada 6 h. Mira qué endpoint concentra los errores (paso 1).
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=burn-rate-slow&value={{ $value | printf \"%.4f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=catalog-availability&from=now-24h"
+
+      - alert: CatalogEdgeDenySpike
+        expr: |
+          sum(rate(loadbalancer_requests_total{backend_service=~"oms-catalog|oms-spa", code="403"}[5m]))
+          /
+          sum(rate(loadbalancer_requests_total{backend_service=~"oms-catalog|oms-spa"}[5m])) > 0.10
+          and
+          sum(rate(loadbalancer_requests_total{backend_service=~"oms-catalog|oms-spa"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-edge
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "El edge devuelve 403 al {{ $value | humanizePercentage }} del tráfico del catálogo (base < 1 %)"
+          description: |
+            El {{ $value | humanizePercentage }} de las peticiones a la tienda recibe 403 desde hace 5 min.
+            Puede ser un ataque bloqueado (correcto) o una regla de Cloud Armor que bloquea a clientes reales (PM #1).
+            Paso 2a del runbook: qué prioridad concentra los DENY y quién la cambió.
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=edge-403&value={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=edge"
+
+      - alert: CatalogTLSCertExpiringSoon
+        expr: |
+          min(probe_ssl_earliest_cert_expiry{probe="catalog-home"}) - time() < 14 * 86400
+        for: 1h
+        labels:
+          severity: warning
+          team: sre
+          service: oms-edge
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "El certificado de www.oms.example.com caduca en {{ $value | humanizeDuration }}"
+          description: |
+            Google renueva oms-web-cert 30 días antes de caducar. Si quedan menos de 14, la renovación está fallando
+            (normalmente CAA o DNS). Revisa managed.domainStatus (paso 2b) en horario laboral, antes de que sea un incidente.
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=cert&value={{ $value | printf \"%.0f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=edge"
+
+      # La probe es la automatización que vigila este runbook: si deja de reportar, CatalogUnavailable
+      # (trigger=probe) no puede disparar nunca.
+      - alert: CatalogProbeMissing
+        expr: |
+          absent(probe_success{probe="catalog-home"})
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-observability
+          runbook: "11-catalog-unavailable"
+        annotations:
+          summary: "La probe catalog-home no reporta desde hace 10 min"
+          description: |
+            El blackbox_exporter de europe-west1 no publica probe_success para catalog-home. Mientras tanto,
+            una caída del edge (CDN, certificado, LB) solo se detectaría por los clientes. Revisa el exporter.
+          runbook_url: "https://runbooks.example.com/11-catalog-unavailable?trigger=probe-missing&probe=catalog-home"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=probes"

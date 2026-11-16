@@ -1,0 +1,111 @@
+# Alertas de Prometheus para el runbook 08-redis-cache-hit-ratio-low.
+# Métricas: cache_requests_total{cache="catalog", result, key_type, revision} y
+# cache_invalidations_total{cache, reason} (app), redis_memory_used_bytes, redis_memory_max_bytes y
+# redis_evicted_keys_total (stackdriver_exporter, Memorystore oms-redis-prod),
+# ops_job_last_success_timestamp_seconds{job="catalog-cache-warmer"} (automatización V3).
+#
+# Diseño de umbrales:
+#   - Base histórica del hit ratio: > 90 %. Umbral al 80 % (no al 85 %) porque después de cada
+#     import pequeño o deploy el ratio baja unos minutos al 85-88 % sin impacto.
+#   - rate de 5 min + for: 15m: se exige un cuarto de hora sostenido, el tiempo de 3 ciclos del TTL
+#     de listings (300 s). Un rate[15m] con for: 15m tardaría ~30 min en avisar.
+#   - Mínimo de 5 lecturas/s: de madrugada el catálogo baja a ~2 lecturas/s y el ratio salta con
+#     cuatro peticiones de un bot.
+#   - Solo warning: un hit ratio bajo no es un error. Si se convierte en latencia o en saturación,
+#     ya pagina APILatencyP95High (runbook 02) o DBConnectionPoolSaturated (runbook 01).
+#   - hit / (hit + miss): los result="error" y "bypass" no entran. Si Redis está caído, el ratio no
+#     significa nada y lo cubre RedisCacheDown (runbook 05).
+
+groups:
+  - name: catalog-cache-efficiency
+    interval: 30s
+    rules:
+
+      - record: catalog:cache_hit_ratio:rate5m
+        expr: |
+          sum by (job) (rate(cache_requests_total{job="oms-catalog", cache="catalog", result="hit"}[5m]))
+          /
+          sum by (job) (rate(cache_requests_total{job="oms-catalog", cache="catalog", result=~"hit|miss"}[5m]))
+
+      - alert: RedisCacheHitRatioLow
+        expr: |
+          catalog:cache_hit_ratio:rate5m < 0.70
+          and
+          sum by (job) (rate(cache_requests_total{job="oms-catalog", cache="catalog", result=~"hit|miss"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-catalog
+          runbook: "08-redis-cache-hit-ratio-low"
+        annotations:
+          summary: "Hit ratio de la caché del catálogo al {{ $value | humanizePercentage }} (base > 90 %)"
+          description: |
+            {{ $labels.job }} lleva 10 min con un hit ratio de {{ $value | humanizePercentage }} en la caché del catálogo
+            (umbral 70 %, base > 90 %). Redis responde, pero las lecturas vuelven a Postgres.
+            Causas típicas, por frecuencia: import masivo, TTL tras un deploy, prefijo de clave nuevo, evictions, bot.
+            Diagnóstico 0 del runbook: ¿cae en todos los key_type o solo en uno?
+          runbook_url: "https://runbooks.example.com/08-redis-cache-hit-ratio-low?job={{ $labels.job }}&value={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?var-job={{ $labels.job }}&viewPanel=hit-ratio&from=now-3h&to=now"
+
+      # Temprana: las evictions suelen llegar antes que la caída del hit ratio. La memoria al 90 %
+      # sola no basta (Redis vive cerca de su máximo con volatile-lru); se exige que expulse claves.
+      - alert: RedisMemoryPressure
+        expr: |
+          max by (instance_id) (redis_memory_used_bytes{instance_id="oms-redis-prod"} / redis_memory_max_bytes{instance_id="oms-redis-prod"}) > 0.9
+          and on (instance_id)
+          sum by (instance_id) (rate(redis_evicted_keys_total{instance_id="oms-redis-prod"}[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-catalog
+          runbook: "08-redis-cache-hit-ratio-low"
+        annotations:
+          summary: "Memorystore {{ $labels.instance_id }} al {{ $value | humanizePercentage }} de memoria y expulsando claves"
+          description: |
+            {{ $labels.instance_id }} usa el {{ $value | humanizePercentage }} de su memoria y lleva 15 min con evictions.
+            Las claves calientes del catálogo (y algún carrito) se están expulsando. Antes de escalar memoria,
+            descarta un bot o un import (diagnóstico 2 y 4): más memoria solo alargaría el problema.
+          runbook_url: "https://runbooks.example.com/08-redis-cache-hit-ratio-low?trigger=memory&instance={{ $labels.instance_id }}&value={{ $value | printf \"%.2f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?var-redis={{ $labels.instance_id }}&viewPanel=memory"
+
+      # Informativa para el canal: un import en marcha se ve aquí antes de que caiga el ratio.
+      - alert: CatalogBulkInvalidationInProgress
+        expr: |
+          sum by (cache) (rate(cache_invalidations_total{cache="catalog", reason="bulk_import"}[5m])) * 60 > 100
+        for: 5m
+        labels:
+          severity: info
+          team: catalog
+          service: oms-catalog
+          runbook: "08-redis-cache-hit-ratio-low"
+        annotations:
+          summary: "Import de catálogo invalidando {{ $value | printf \"%.0f\" }} claves/min"
+          description: |
+            Hay un import del backoffice invalidando {{ $value | printf "%.0f" }} claves por minuto (base < 5/min).
+            Si no usa --batch-invalidate, el hit ratio va a caer. Coordina en #oms-backoffice (Acción 4a).
+          runbook_url: "https://runbooks.example.com/08-redis-cache-hit-ratio-low?trigger=bulk_import&cache={{ $labels.cache }}&value={{ $value | printf \"%.0f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?viewPanel=invalidations"
+
+      # V3: el pre-calentado corre a diario a las 05:30 y después de cada deploy de oms-catalog y de
+      # cada import. Si deja de ejecutarse, el siguiente deploy vuelve a arrancar con la caché fría.
+      - alert: CatalogCacheWarmerStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="catalog-cache-warmer"}) > 26 * 3600
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="catalog-cache-warmer"})
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "08-redis-cache-hit-ratio-low"
+        annotations:
+          summary: "El Cloud Run Job oms-catalog-cache-warmer no termina con éxito desde hace > 26 h"
+          description: |
+            El pre-calentado de la caché del catálogo (Cloud Scheduler 05:30 + hook post-deploy y post-import)
+            lleva más de 26 h sin éxito. Sin él, cada deploy e import arranca con la caché fría.
+            Revisa: gcloud run jobs executions list --job=oms-catalog-cache-warmer --region=europe-west3 --limit=5
+          runbook_url: "https://runbooks.example.com/08-redis-cache-hit-ratio-low?section=automatizacion&job=catalog-cache-warmer"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?viewPanel=ops-automation"

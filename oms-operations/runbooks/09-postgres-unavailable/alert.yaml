@@ -1,0 +1,156 @@
+# Alertas de Prometheus para el runbook 09-postgres-unavailable.
+# Métricas: cloudsql_* (stackdriver_exporter, ~1–3 min de retraso), pg_up (postgres_exporter en el
+# bastión, scrape cada 30 s) y db_connection_errors_total (app). Ver observability/instrumentation.md.
+#
+# Diseño:
+#   - Dos fuentes independientes, porque cada una falla sola:
+#       · cloudsql_up: la ve Google, no depende del bastión, pero llega con retraso.
+#       · pg_up: inmediata, pero si cae el bastión o el proxy da 0 con la BD sana. Por eso solo
+#         cuenta si la app también tiene errores de conexión (la app no miente sobre lo que sufre).
+#   - for: 1m en la critical: un failover HA tarda ~60 s (NFR-AVAIL-001). Paginar a los 20 s
+#     despertaría a alguien para mirar cómo se arregla solo.
+#   - PostgresUnavailableFast (for: 20s) NO pagina: va solo al webhook de oms-ops-flag-automator,
+#     que enciende checkout.maintenance-page y catalog.serve-stale (V3). La degradación tiene que
+#     llegar antes que la persona.
+#   - CloudSQLFailoverInProgress: tras un failover el standby tarda 30–120 min en reconstruirse y
+#     mientras tanto NO hay HA. No es urgente, pero nadie debe tocar la instancia en ese rato.
+#   - DRReplicaLagHigh y CloudSQLBackupMissing: OPS-005 (RPO ≤ 1 h, PITR 14 d). Son las que dicen si
+#     las Acciones 5 y 6 del runbook son viables el día que hagan falta.
+#   - V3: el ejercicio mensual de restauración PITR también tiene alerta. La salud del automatizador
+#     de flags la vigila FlagAutomatorStale (definida en observability/ops-automation-alerts.yaml).
+
+groups:
+  - name: postgres-availability
+    interval: 15s
+    rules:
+
+      - alert: PostgresUnavailable
+        expr: |
+          max(cloudsql_up{database_id="oms-production:oms-pg-prod"}) == 0
+          or
+          (
+            max(pg_up) == 0
+            and on ()
+            sum(rate(db_connection_errors_total{job=~"oms-orders|oms-catalog|oms-outbox-relay"}[2m])) > 0.1
+          )
+        for: 1m
+        labels:
+          severity: critical
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "09-postgres-unavailable"
+        annotations:
+          summary: "Postgres oms-pg-prod no disponible desde hace > 1 min: checkout parado"
+          description: |
+            Cloud SQL informa oms-pg-prod caída, o postgres_exporter no conecta y las apps registran errores
+            de conexión (valor: {{ $value }}). Fallan checkout, login, backoffice y outbox; el catálogo sigue
+            desde Redis. Si hay un failover HA en curso, se resuelve solo en ~60 s: NO lances otra operación.
+            Primer paso: diagnóstico 0–2 (¿real?, estado, operaciones en curso).
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?instance=oms-pg-prod&value={{ $value }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=availability&from=now-30m&to=now"
+
+      # Solo automatización: ruta "automation" de Alertmanager → webhook de oms-ops-flag-automator.
+      # No va a PagerDuty ni a Slack. El automatizador apaga los flags tras 5 min con la BD estable.
+      - alert: PostgresUnavailableFast
+        expr: |
+          max(cloudsql_up{database_id="oms-production:oms-pg-prod"}) == 0
+          or
+          (
+            max(pg_up) == 0
+            and on ()
+            sum(rate(db_connection_errors_total{job=~"oms-orders|oms-catalog|oms-outbox-relay"}[1m])) > 0.1
+          )
+        for: 20s
+        labels:
+          severity: automation
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "09-postgres-unavailable"
+          automation: "flags:checkout.maintenance-page,catalog.serve-stale"
+        annotations:
+          summary: "Degradación automática: oms-pg-prod sin respuesta desde hace 20 s"
+          description: |
+            El automatizador enciende checkout.maintenance-page y catalog.serve-stale (OPS-007) y lo anuncia
+            en #oms-alerts. Si la caída supera 1 min, PostgresUnavailable paginará al on-call.
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?trigger=automation&instance=oms-pg-prod#acción-1-degradación-elegante-con-feature-flags-impacto-bajo--reversible-en-15-s--automática-desde-v3"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=availability&from=now-30m&to=now"
+
+      - alert: CloudSQLFailoverInProgress
+        expr: |
+          max by (database_id) (cloudsql_available_for_failover{database_id="oms-production:oms-pg-prod"}) == 0
+        for: 2m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "09-postgres-unavailable"
+        annotations:
+          summary: "{{ $labels.database_id }}: HA no disponible (failover en curso o standby reconstruyéndose)"
+          description: |
+            {{ $labels.database_id }} no tiene standby listo para failover desde hace > 2 min. Es normal durante
+            un failover o un mantenimiento y hasta 30–120 min después, mientras se reconstruye el standby.
+            Mientras dure, un segundo fallo NO tiene failover automático. No lances patch, restart ni
+            failover manual. Si dura > 3 h, abre caso con soporte de Google Cloud.
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?database_id={{ $labels.database_id }}&trigger=failover-in-progress#2-hay-alguna-operación-en-curso-no-actúes-encima-de-ella"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=ha-replicas&from=now-3h"
+
+  - name: postgres-recoverability
+    interval: 60s
+    rules:
+
+      - alert: DRReplicaLagHigh
+        expr: |
+          max by (replica) (cloudsql_replication_lag_seconds{replica="oms-pg-dr"}) > 300
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-dr
+          runbook: "09-postgres-unavailable"
+        annotations:
+          summary: "Réplica DR {{ $labels.replica }} con {{ $value | humanizeDuration }} de retraso"
+          description: |
+            La réplica cross-region {{ $labels.replica }} (europe-west1) va {{ $value | humanizeDuration }} por detrás
+            del primario. Si hubiera que activar el DR ahora (Acción 6), se perdería ese tiempo de datos.
+            RPO objetivo ≤ 1 h (OPS-005). Revisa slots y red (runbook 06, paso 3).
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?replica={{ $labels.replica }}&lag_s={{ $value | printf \"%.0f\" }}#acción-6-activar-el-dr-en-europe-west1-impacto-muy-alto--irreversible--aprueba-el-cto"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=ha-replicas&var-replica={{ $labels.replica }}"
+
+      - alert: CloudSQLBackupMissing
+        expr: |
+          (time() - max by (database_id) (cloudsql_last_backup_success_timestamp_seconds{database_id="oms-production:oms-pg-prod"})) > 26 * 3600
+        for: 30m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "09-postgres-unavailable"
+        annotations:
+          summary: "{{ $labels.database_id }} sin backup correcto desde hace {{ $value | humanizeDuration }}"
+          description: |
+            El último backup automático correcto de {{ $labels.database_id }} es de hace {{ $value | humanizeDuration }}
+            (umbral 26 h; el backup es diario). PITR (14 d, OPS-005) depende de los backups: sin ellos, la
+            Acción 5 del runbook puede no ser posible. Revisa gcloud sql backups list --instance=oms-pg-prod.
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?database_id={{ $labels.database_id }}&backup_age_s={{ $value | printf \"%.0f\" }}#acción-5-restaurar-con-pitr-en-una-instancia-nueva-impacto-alto--pérdida-de-datos--aprueba-el-em"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=backups"
+
+      # V3: Cloud Scheduler mensual → Cloud Run Job oms-ops-pitr-drill (clona con PITR, valida, mide y borra).
+      - alert: PITRRestoreDrillStale
+        expr: |
+          (time() - max(ops_job_last_success_timestamp_seconds{job="pitr-restore-drill"})) > 35 * 86400
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="pitr-restore-drill"})
+        for: 1h
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "09-postgres-unavailable"
+        annotations:
+          summary: "El ejercicio mensual de restauración PITR no termina con éxito desde hace > 35 días"
+          description: |
+            Un backup que no se ha restaurado nunca es una esperanza, no un backup. El job oms-ops-pitr-drill
+            (clon PITR de oms-pg-prod, validación de datos y medición del tiempo de restauración) lleva más de
+            35 días sin éxito. Revisa sus logs y ejecútalo a mano en horario laboral.
+          runbook_url: "https://runbooks.example.com/09-postgres-unavailable?section=automatizacion&job=pitr-restore-drill"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=ops-jobs"

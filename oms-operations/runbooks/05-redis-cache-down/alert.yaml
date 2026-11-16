@@ -1,0 +1,114 @@
+# Alertas de Prometheus para el runbook 05-redis-cache-down.
+# Métricas: redis_up (stackdriver_exporter, Memorystore oms-redis-prod), cache_requests_total y
+# circuit_breaker_state{breaker="redis"} (app, OpenTelemetry), feature_flag_enabled (SDK de Unleash
+# en la app) y ops_job_last_success_timestamp_seconds (automatizaciones de SRE).
+#
+# Diseño de umbrales:
+#   - Dos reglas critical con el MISMO nombre (RedisCacheDown) y una etiqueta `trigger` distinta:
+#       · redis_up == 0 durante 1 min: Memorystore caído según Google. 1 min basta porque la
+#         señal es binaria y un failover limpio de STANDARD_HA dura < 1 min (no despierta a nadie).
+#       · > 50 % de errores de la app hacia Redis durante 2 min: cubre lo que redis_up no ve
+#         (red, AUTH, TLS, revisión nueva sin egress a la VPC). 50 % porque por debajo el
+#         circuit breaker ya absorbe los fallos sin que el usuario lo note.
+#     Mínimo de 1 llamada/s para que a las 4 AM 3 errores de 4 llamadas no paginen.
+#   - Con el breaker abierto, las llamadas cortocircuitadas cuentan como result="error" (para la
+#     app, Redis no está disponible). Con el flag catalog.cache-bypass cuentan como result="bypass",
+#     así que la regla app_errors se resuelve sola al mitigar; la de redis_up no.
+#   - warning a 5 % de errores durante 5 min: errores parciales (OOM, READONLY, maxclients).
+#   - Dos alertas de la automatización V3: el bypass olvidado y el automatizador muerto.
+
+groups:
+  - name: catalog-redis
+    interval: 30s
+    rules:
+
+      - alert: RedisCacheDown
+        expr: |
+          max(redis_up{instance_id="oms-redis-prod"}) == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-catalog
+          trigger: redis_up
+          runbook: "05-redis-cache-down"
+        annotations:
+          summary: "Memorystore oms-redis-prod no responde (redis_up = {{ $value }})"
+          description: |
+            Cloud Monitoring reporta redis_up = {{ $value }} para oms-redis-prod desde hace más de 1 min.
+            El catálogo lee de Postgres a través del circuit breaker: más lento, pero sirviendo.
+            Riesgo: estampida contra el primario de Cloud SQL y carritos solo en localStorage.
+            Primer paso: comprueba que el automatizador activó catalog.cache-bypass (#oms-alerts) y ejecuta el diagnóstico 1.
+          runbook_url: "https://runbooks.example.com/05-redis-cache-down?trigger=redis_up&instance=oms-redis-prod&value={{ $value }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?var-redis=oms-redis-prod&from=now-1h&to=now"
+
+      - alert: RedisCacheDown
+        expr: |
+          (
+            sum by (job) (rate(cache_requests_total{job="oms-catalog", result="error"}[2m]))
+            /
+            sum by (job) (rate(cache_requests_total{job="oms-catalog"}[2m]))
+          ) > 0.5
+          and
+          sum by (job) (rate(cache_requests_total{job="oms-catalog"}[2m])) > 1
+        for: 2m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-catalog
+          trigger: app_errors
+          runbook: "05-redis-cache-down"
+        annotations:
+          summary: "{{ $value | humanizePercentage }} de las llamadas de {{ $labels.job }} a Redis fallan"
+          description: |
+            {{ $labels.job }} lleva 2 min con un {{ $value | humanizePercentage }} de errores al hablar con Redis (umbral 50 %).
+            Si redis_up sigue en 1, Memorystore está sano y el fallo está en el camino app → Redis
+            (red, AUTH rotado, revisión nueva sin egress a la VPC). Diagnóstico 2 y 3 del runbook.
+          runbook_url: "https://runbooks.example.com/05-redis-cache-down?trigger=app_errors&job={{ $labels.job }}&value={{ $value | printf \"%.2f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?var-job={{ $labels.job }}&from=now-1h&to=now"
+
+      - alert: RedisCacheErrorsElevated
+        expr: |
+          (
+            sum by (job, cache) (rate(cache_requests_total{job="oms-catalog", result="error"}[5m]))
+            /
+            sum by (job, cache) (rate(cache_requests_total{job="oms-catalog"}[5m]))
+          ) > 0.05
+          and
+          sum by (job, cache) (rate(cache_requests_total{job="oms-catalog"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-catalog
+          runbook: "05-redis-cache-down"
+        annotations:
+          summary: "Errores parciales de Redis en {{ $labels.job }} (caché {{ $labels.cache }}): {{ $value | humanizePercentage }}"
+          description: |
+            El {{ $value | humanizePercentage }} de las llamadas a Redis de la caché {{ $labels.cache }} fallan desde hace 5 min.
+            Todavía no es una caída. Patrones típicos: OOM (memoria llena), READONLY (tras un failover),
+            maxclients. Mira error_code en los logs (diagnóstico 3) en horario laboral.
+          runbook_url: "https://runbooks.example.com/05-redis-cache-down?trigger=partial&job={{ $labels.job }}&cache={{ $labels.cache }}&value={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?var-job={{ $labels.job }}&var-cache={{ $labels.cache }}"
+
+      # V3: el bypass olvidado deja el catálogo leyendo de Postgres para siempre (p95 ~200 ms
+      # en vez de 35 ms y 6-10x de carga en el primario). and on() porque las dos series no
+      # comparten etiquetas.
+      - alert: CatalogCacheBypassLeftOn
+        expr: |
+          max(feature_flag_enabled{job="oms-catalog", flag="catalog.cache-bypass"}) == 1
+          and on()
+          max(redis_up{instance_id="oms-redis-prod"}) == 1
+        for: 2h
+        labels:
+          severity: warning
+          team: sre
+          service: oms-catalog
+          runbook: "05-redis-cache-down"
+        annotations:
+          summary: "catalog.cache-bypass sigue en ON con Redis sano desde hace 2 h"
+          description: |
+            Redis lleva más de 2 h respondiendo, pero el catálogo sigue sin usar la caché.
+            Haz el warm-up y el apagado escalonado de la sección Verificación §2 (no lo apagues de golpe).
+          runbook_url: "https://runbooks.example.com/05-redis-cache-down?section=verificacion&flag=catalog.cache-bypass"
+          dashboard_url: "https://grafana.example.com/d/oms-cache?viewPanel=flags"

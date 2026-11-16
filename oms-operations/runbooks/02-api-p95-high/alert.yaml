@@ -1,0 +1,193 @@
+# Alertas de Prometheus para el runbook 02-api-p95-high.
+# Métricas definidas en observability/instrumentation.md: histograma http_request_duration_seconds
+# (OpenTelemetry → Managed Prometheus, etiquetas job / endpoint / method / revision).
+# El histograma tiene buckets en 0.25 y 0.8 exactos: el SLO 2 se calcula con el bucket, no interpolando.
+#
+# Diseño de umbrales:
+#   - APILatencyP95High warning a 250 ms (NFR-PERF-002) durante 10 min → Slack. 10 min y no 5 porque
+#     un p95 de 5 min oscila mucho con poco tráfico; queremos tendencia, no picos.
+#   - APILatencyP95High critical a 500 ms (2× el objetivo) durante 10 min → PagerDuty. Alertmanager
+#     inhibe la warning cuando está la critical (inhibit_rule por alertname + job + endpoint).
+#   - Mínimo de tráfico: 0,2 req/s por endpoint (~120 peticiones en 10 min). Por debajo, 6 peticiones
+#     lentas ya son el p95 y la alerta sería ruido de madrugada.
+#   - POST /api/orders queda fuera: incluye la llamada a Stripe (presupuesto propio, runbook 03).
+#   - OrdersLatencyBurnRate: multiwindow multi-burn-rate sobre el SLO 2 de Orders, igual que el SLO 1
+#     en 01/alert.yaml. Es la alerta que importa al usuario; las de p95/p99 son el diagnóstico.
+
+groups:
+  - name: api-latency-recording
+    interval: 30s
+    rules:
+      # Endpoints críticos: GET de pedidos y productos + carrito y emisión de token (cualquier método).
+      - record: oms:critical_endpoint_latency_bucket:rate5m
+        expr: |
+          sum by (le, job, endpoint) (
+            rate(http_request_duration_seconds_bucket{job=~"oms-catalog|oms-orders", method="GET", endpoint=~"/api/orders.*|/api/products.*"}[5m])
+            or
+            rate(http_request_duration_seconds_bucket{job=~"oms-catalog|oms-orders", endpoint=~"/api/cart.*|/api/auth/token"}[5m])
+          )
+      - record: oms:critical_endpoint_requests:rate5m
+        expr: |
+          sum by (job, endpoint) (
+            rate(http_request_duration_seconds_count{job=~"oms-catalog|oms-orders", method="GET", endpoint=~"/api/orders.*|/api/products.*"}[5m])
+            or
+            rate(http_request_duration_seconds_count{job=~"oms-catalog|oms-orders", endpoint=~"/api/cart.*|/api/auth/token"}[5m])
+          )
+
+  - name: api-latency
+    interval: 30s
+    rules:
+
+      - alert: APILatencyP95High
+        expr: |
+          histogram_quantile(0.95, oms:critical_endpoint_latency_bucket:rate5m) > 0.25
+          and on (job, endpoint)
+          oms:critical_endpoint_requests:rate5m > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "02-api-p95-high"
+        annotations:
+          summary: "p95 de {{ $labels.endpoint }} ({{ $labels.job }}) = {{ $value | humanizeDuration }} (> 250 ms)"
+          description: |
+            El p95 de {{ $labels.endpoint }} en {{ $labels.job }} es {{ $value | humanizeDuration }} desde hace
+            más de 10 min (objetivo NFR-PERF-002: 250 ms). Sin impacto grave todavía.
+            Primer paso: diagnóstico 0 (¿un endpoint o todos?) y 2 (¿deploy reciente?).
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job={{ $labels.job }}&endpoint={{ $labels.endpoint | urlquery }}&p95={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=latency-by-endpoint&var-job={{ $labels.job }}&var-endpoint={{ $labels.endpoint | urlquery }}&from=now-1h&to=now"
+
+      - alert: APILatencyP95High
+        expr: |
+          histogram_quantile(0.95, oms:critical_endpoint_latency_bucket:rate5m) > 0.5
+          and on (job, endpoint)
+          oms:critical_endpoint_requests:rate5m > 0.2
+        for: 10m
+        labels:
+          severity: critical
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "02-api-p95-high"
+        annotations:
+          summary: "p95 de {{ $labels.endpoint }} ({{ $labels.job }}) = {{ $value | humanizeDuration }} (> 500 ms, 2× objetivo)"
+          description: |
+            El p95 de {{ $labels.endpoint }} en {{ $labels.job }} lleva 10 min por encima de 500 ms
+            (valor actual {{ $value | humanizeDuration }}). El usuario lo nota en cada clic.
+            Diagnóstico 0–3 del runbook: endpoint, deploy y tramo de la traza que se come el tiempo.
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job={{ $labels.job }}&endpoint={{ $labels.endpoint | urlquery }}&p95={{ $value | printf \"%.3f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=latency-by-endpoint&var-job={{ $labels.job }}&var-endpoint={{ $labels.endpoint | urlquery }}&from=now-1h&to=now"
+
+      - alert: APILatencyP99High
+        expr: |
+          histogram_quantile(0.99, oms:critical_endpoint_latency_bucket:rate5m) > 0.8
+          and on (job, endpoint)
+          oms:critical_endpoint_requests:rate5m > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: sre
+          service: "{{ $labels.job }}"
+          runbook: "02-api-p95-high"
+        annotations:
+          summary: "p99 de {{ $labels.endpoint }} ({{ $labels.job }}) = {{ $value | humanizeDuration }} (> 800 ms)"
+          description: |
+            El p99 de {{ $labels.endpoint }} supera 800 ms (NFR-PERF-003) desde hace 10 min.
+            Si el p95 está bien y solo sube el p99, sospecha de cold starts (diagnóstico 4).
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job={{ $labels.job }}&endpoint={{ $labels.endpoint | urlquery }}&p99={{ $value | printf \"%.3f\" }}&section=cold-starts"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=latency-by-endpoint&var-job={{ $labels.job }}"
+
+      - alert: SearchLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le, job, endpoint) (rate(http_request_duration_seconds_bucket{job="oms-catalog", endpoint="/api/search"}[5m]))) > 0.3
+          and on (job, endpoint)
+          sum by (job, endpoint) (rate(http_request_duration_seconds_count{job="oms-catalog", endpoint="/api/search"}[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: catalog
+          service: oms-catalog
+          runbook: "02-api-p95-high"
+          automation: "flag-automator"     # V3: el webhook enciende catalog.search-suggestions-disabled
+        annotations:
+          summary: "Búsqueda lenta: p95 de /api/search = {{ $value | humanizeDuration }} (> 300 ms)"
+          description: |
+            El p95 de /api/search lleva 10 min por encima de 300 ms (NFR-PERF-004).
+            oms-ops-flag-automator enciende catalog.search-suggestions-disabled al recibir esta alerta
+            y lo apaga 30 min después de que se resuelva. Comprueba con flag_get que lo ha hecho.
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job={{ $labels.job }}&endpoint=%2Fapi%2Fsearch&p95={{ $value | printf \"%.3f\" }}&section=accion-1"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=search-latency"
+
+  # ─── Burn rate del SLO 2 de Orders (latencia de GET /api/orders*, 28 d) ───
+  # Dos objetivos: 95 % < 250 ms (budget 0,05) y 99 % < 800 ms (budget 0,01).
+  # Rápida: 14,4× en 1 h y 5 min (2 % del budget por hora) → page.
+  # Lenta:   6×   en 6 h y 30 min (5 % del budget en 6 h)  → Slack, revisar en horario laboral.
+  # ~40.000 GET/día: se exige un mínimo de peticiones en la ventana larga.
+  - name: orders-latency-slo
+    interval: 30s
+    rules:
+      - record: slo:orders_get_slow250:ratio_rate5m
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.25"}[5m])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[5m])))
+      - record: slo:orders_get_slow250:ratio_rate30m
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.25"}[30m])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[30m])))
+      - record: slo:orders_get_slow250:ratio_rate1h
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.25"}[1h])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[1h])))
+      - record: slo:orders_get_slow250:ratio_rate6h
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.25"}[6h])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[6h])))
+      - record: slo:orders_get_slow800:ratio_rate5m
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.8"}[5m])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[5m])))
+      - record: slo:orders_get_slow800:ratio_rate30m
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.8"}[30m])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[30m])))
+      - record: slo:orders_get_slow800:ratio_rate1h
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.8"}[1h])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[1h])))
+      - record: slo:orders_get_slow800:ratio_rate6h
+        expr: 1 - (sum(rate(http_request_duration_seconds_bucket{job="oms-orders", method="GET", endpoint=~"/api/orders.*", le="0.8"}[6h])) / sum(rate(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[6h])))
+
+      - alert: OrdersLatencyBurnRate
+        expr: |
+          (
+            (slo:orders_get_slow250:ratio_rate1h > (14.4 * 0.05) and slo:orders_get_slow250:ratio_rate5m > (14.4 * 0.05))
+            or
+            (slo:orders_get_slow800:ratio_rate1h > (14.4 * 0.01) and slo:orders_get_slow800:ratio_rate5m > (14.4 * 0.01))
+          )
+          and on ()
+          sum(increase(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[1h])) > 300
+        for: 2m
+        labels:
+          severity: critical
+          team: orders
+          service: oms-orders
+          slo: orders-latency
+          runbook: "02-api-p95-high"
+        annotations:
+          summary: "SLO 2 Orders: {{ $value | humanizePercentage }} de GET /api/orders* lentas (×14,4 en 1 h)"
+          description: |
+            {{ $value | humanizePercentage }} de las consultas de pedidos de la última hora superan el umbral del SLO 2
+            (250 ms para el objetivo del 95 % u 800 ms para el del 99 %). A este ritmo se consume el 2 % del
+            budget mensual cada hora. Diagnóstico 0 del runbook con job=oms-orders.
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job=oms-orders&endpoint=%2Fapi%2Forders&trigger=burn-rate-fast&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=slo-orders-latency"
+
+      - alert: OrdersLatencyBurnRate
+        expr: |
+          (
+            (slo:orders_get_slow250:ratio_rate6h > (6 * 0.05) and slo:orders_get_slow250:ratio_rate30m > (6 * 0.05))
+            or
+            (slo:orders_get_slow800:ratio_rate6h > (6 * 0.01) and slo:orders_get_slow800:ratio_rate30m > (6 * 0.01))
+          )
+          and on ()
+          sum(increase(http_request_duration_seconds_count{job="oms-orders", method="GET", endpoint=~"/api/orders.*"}[6h])) > 1500
+        for: 15m
+        labels:
+          severity: warning
+          team: orders
+          service: oms-orders
+          slo: orders-latency
+          runbook: "02-api-p95-high"
+        annotations:
+          summary: "SLO 2 Orders: degradación sostenida, {{ $value | humanizePercentage }} de consultas lentas en 6 h (×6)"
+          description: |
+            Las consultas de pedidos llevan 6 h con {{ $value | humanizePercentage }} de peticiones por encima del umbral.
+            No es un pico: suele ser una query que empeora con el volumen o una réplica con lag. Revisar hoy.
+          runbook_url: "https://runbooks.example.com/02-api-p95-high?job=oms-orders&endpoint=%2Fapi%2Forders&trigger=burn-rate-slow&value={{ $value | printf \"%.4f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=slo-orders-latency&from=now-24h"

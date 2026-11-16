@@ -1,0 +1,136 @@
+# Alertas de Prometheus para el runbook 10-checkout-unavailable.
+# Métricas definidas en observability/instrumentation.md: probe sintética checkout-e2e (blackbox desde
+# europe-west1, fuera de la región primaria) y http_requests_total del monolito.
+#
+# Diseño:
+#   - Dos señales complementarias con el mismo nombre de alerta (etiqueta `signal`):
+#       probe → ve lo que ve el cliente, incluidas las capas que la app no ve (DNS, TLS, Cloud Armor,
+#               LB, Cloud Run sin instancias). Un 403/429 de Cloud Armor no es 5xx y el SLO 1 lo
+#               excluye: sin la probe, el PM #1 habría seguido invisible.
+#       5xx   → ve fallos parciales que la probe puede no pisar (una revisión al 10 %, un tipo de pedido).
+#   - La probe se ejecuta una vez por minuto (cada ejecución crea y cancela un pedido sintético).
+#     "≥ 2 de 3 ejecuciones" = avg_over_time(...[3m]) < 0.5. Una sola ejecución fallida no pagina.
+#   - 5xx > 5 % en 3 min con un mínimo de 5 peticiones: con ~2–4 pedidos/min en punta, 1 error aislado
+#     no dispara. De madrugada el tráfico no llega al mínimo y la señal de probe es la que cubre.
+#   - Las burn rate del SLO 1 (OrdersAvailabilityBurnRateFast / Slow) ya están en
+#     01-db-pool-saturated/alert.yaml y apuntan a este runbook. No se duplican aquí.
+
+groups:
+  - name: checkout-e2e
+    interval: 30s
+    rules:
+
+      - alert: CheckoutUnavailable
+        expr: |
+          avg_over_time(probe_success{probe="checkout-e2e"}[3m]) < 0.5
+        for: 1m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-checkout
+          signal: probe
+          runbook: "10-checkout-unavailable"
+        annotations:
+          summary: "Checkout caído según la probe {{ $labels.probe }}: éxito {{ $value | humanizePercentage }} en 3 min"
+          description: |
+            La probe sintética {{ $labels.probe }} ({{ $labels.instance }}, desde europe-west1) falla en al menos
+            2 de sus 3 últimas ejecuciones (éxito: {{ $value | humanizePercentage }}). Un cliente no puede completar
+            una compra. Primer paso: diagnóstico 0 y 1 (¿qué código devuelve el LB?) para localizar la capa.
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?signal=probe&probe={{ $labels.probe }}&instance={{ $labels.instance }}&value={{ $value | printf \"%.2f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=checkout-e2e&from=now-1h&to=now"
+
+      - alert: CheckoutUnavailable
+        expr: |
+          (
+            sum by (job) (rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[3m]))
+            /
+            sum by (job) (rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[3m]))
+          ) > 0.05
+          and
+          sum by (job) (increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST"}[3m])) >= 5
+        for: 3m
+        labels:
+          severity: critical
+          team: sre
+          service: oms-checkout
+          signal: 5xx
+          runbook: "10-checkout-unavailable"
+        annotations:
+          summary: "Checkout con {{ $value | humanizePercentage }} de 5xx en POST /api/orders ({{ $labels.job }})"
+          description: |
+            {{ $value | humanizePercentage }} de las peticiones válidas a POST /api/orders de {{ $labels.job }} terminan
+            en 5xx desde hace más de 3 min (umbral 5 %). Con el checkout caído del todo, cada minuto en hora punta
+            se lleva ~3 de los ~70 fallos de budget del SLO 1 (≈ 4 %).
+            Mira primero el paso 2 (¿revisión nueva?) y las ramas B–F.
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?signal=5xx&job={{ $labels.job }}&value={{ $value | printf \"%.3f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=checkout-e2e&var-job={{ $labels.job }}&from=now-1h&to=now"
+
+      - alert: CheckoutDegraded
+        expr: |
+          (
+            sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[10m]))
+            /
+            sum(rate(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code!~"4.."}[10m]))
+          ) > 0.01
+          and on()
+          sum(increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", code=~"5.."}[10m])) >= 3
+          or on()
+          (
+            sum(count_over_time((probe_success{probe="checkout-e2e"} == 0)[15m:1m])) >= 2
+          )
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-checkout
+          runbook: "10-checkout-unavailable"
+        annotations:
+          summary: "Checkout degradado: 5xx > 1 % o ≥ 2 fallos de probe en 15 min (valor {{ $value | printf \"%.3f\" }})"
+          description: |
+            El checkout falla de forma intermitente: ratio de 5xx > 1 % en 10 min o al menos 2 ejecuciones
+            fallidas de checkout-e2e en 15 min (valor: {{ $value | printf "%.3f" }}). Todavía no es una caída.
+            Revisa en horario laboral el paso 1 (códigos del LB) antes de que escale a CheckoutUnavailable.
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?signal=degraded&value={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=checkout-e2e&from=now-3h&to=now"
+
+      # Si la probe deja de reportar, CheckoutUnavailable (signal=probe) no puede disparar: estamos ciegos
+      # ante cualquier fallo de borde, que es justo lo que solo la probe ve.
+      - alert: CheckoutProbeMissing
+        expr: |
+          absent_over_time(probe_success{probe="checkout-e2e"}[10m])
+        for: 5m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-observability
+          runbook: "10-checkout-unavailable"
+        annotations:
+          summary: "La probe checkout-e2e no reporta desde hace > 10 min"
+          description: |
+            No hay muestras de probe_success{probe="checkout-e2e"} en 10 min. Sin ella, un bloqueo de Cloud Armor
+            o un fallo de DNS/TLS no generaría ninguna alerta (el SLO 1 no ve el borde). Revisa el
+            blackbox_exporter de europe-west1 y la cuenta sintética.
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?section=rama-h&probe=checkout-e2e"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=checkout-e2e"
+
+      # V3: el job oms-ops-checkout-triage pasa un autotest cada 6 h (Cloud Scheduler). Si deja de pasarlo,
+      # el día que dispare CheckoutUnavailable no habrá tarjeta de triage y el on-call no lo sabrá.
+      - alert: CheckoutTriageAutomationStale
+        expr: |
+          time() - max(ops_job_last_success_timestamp_seconds{job="checkout-triage-selftest"}) > 7 * 3600
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="checkout-triage-selftest"})
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "10-checkout-unavailable"
+        annotations:
+          summary: "El triage automático del checkout no pasa su autotest desde hace > 7 h"
+          description: |
+            oms-ops-checkout-triage no publica un autotest correcto desde hace más de 7 h (se ejecuta cada 6 h).
+            Si ahora dispara CheckoutUnavailable no habrá tarjeta de triage en #incident-response: sigue el
+            árbol del runbook a mano. Revisa los logs del job y sus permisos (Prometheus, Logging, Unleash).
+          runbook_url: "https://runbooks.example.com/10-checkout-unavailable?section=automatizacion&job=checkout-triage-selftest"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=ops-jobs"

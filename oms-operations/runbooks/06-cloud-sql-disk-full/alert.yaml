@@ -1,0 +1,160 @@
+# Alertas de Prometheus para el runbook 06-cloud-sql-disk-full.
+# Métricas: cloudsql_* (stackdriver_exporter + recording rules de renombrado) y pg_replication_slot_*
+# (consulta personalizada de postgres_exporter). Ver observability/instrumentation.md.
+#
+# Diseño (prevención > reacción):
+#   - Con auto storage increase activado, "disco lleno" respecto a la cuota actual NO es una caída:
+#     Cloud SQL crece solo. Pero cada crecimiento es permanente (el disco no se reduce) y tiene un
+#     tope (--storage-auto-increase-limit). Por eso:
+#       · warning al 80 % (15 min): el auto-increase está a punto de gastar dinero para siempre.
+#       · critical al 90 % (10 min): el auto-increase ya debería haber actuado; si sigue > 90 %,
+#         está en su límite o el crecimiento le gana → riesgo real de escrituras fallando.
+#       · predicción contra el LÍMITE (no contra la cuota): es el techo físico de verdad.
+#   - El límite del auto-increase es configuración (Terraform), no una métrica de GCP. Lo
+#     publicamos como recording rule constante. Si se cambia el límite, se cambia aquí también.
+#   - Las métricas de Cloud SQL llegan con ~3 min de retraso: por eso los for: son largos.
+#   - V3: slots inactivos y job semanal de limpieza vigilados (las dos causas de PM #1 y del bloat).
+
+groups:
+  - name: cloudsql-disk
+    interval: 60s
+    rules:
+
+      # 300 GB (GiB, como los cuenta Cloud SQL). Mantener sincronizado con
+      # disk_autoresize_limit del módulo de Terraform de oms-pg-prod.
+      - record: oms:cloudsql_disk_autoincrease_limit_bytes
+        expr: vector(300 * 1024 * 1024 * 1024)
+        labels:
+          database_id: "oms-production:oms-pg-prod"
+
+      - alert: CloudSQLDiskUsageHigh
+        expr: |
+          max by (database_id) (
+            cloudsql_disk_bytes_used{database_id="oms-production:oms-pg-prod"}
+            / cloudsql_disk_quota_bytes{database_id="oms-production:oms-pg-prod"}
+          ) > 0.90
+        for: 10m
+        labels:
+          severity: critical
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "Disco de {{ $labels.database_id }} al {{ $value | humanizePercentage }} (> 90 % durante 10 min)"
+          description: |
+            El disco de Cloud SQL {{ $labels.database_id }} está al {{ $value | humanizePercentage }} desde hace
+            más de 10 min. El auto storage increase no lo ha corregido: o está en su límite o el crecimiento
+            es más rápido. Al 100 % fallan todas las escrituras (checkout incluido).
+            Primer paso: diagnóstico 0 y 2 (velocidad de crecimiento; datos, WAL o temporales).
+            NO subas el disco antes de diagnosticar: el cambio es irreversible.
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?database_id={{ $labels.database_id }}&usage={{ $value | printf \"%.3f\" }}&severity=critical"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=disk&from=now-24h&to=now"
+
+      - alert: CloudSQLDiskUsageHigh
+        expr: |
+          max by (database_id) (
+            cloudsql_disk_bytes_used{database_id="oms-production:oms-pg-prod"}
+            / cloudsql_disk_quota_bytes{database_id="oms-production:oms-pg-prod"}
+          ) > 0.80
+        for: 15m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "Disco de {{ $labels.database_id }} al {{ $value | humanizePercentage }}: el auto-increase va a crecer"
+          description: |
+            {{ $labels.database_id }} lleva 15 min por encima del 80 % ({{ $value | humanizePercentage }}).
+            Sin impacto todavía, pero el próximo auto-increase será permanente. Revisa en horario laboral
+            qué crece (diagnóstico 2–5) antes de dejar que el disco crezca solo.
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?database_id={{ $labels.database_id }}&usage={{ $value | printf \"%.3f\" }}&severity=warning"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=disk&from=now-7d&to=now"
+
+      - alert: CloudSQLDiskWillFillIn24h
+        expr: |
+          max by (database_id) (
+            predict_linear(cloudsql_disk_bytes_used{database_id="oms-production:oms-pg-prod"}[6h], 24 * 3600)
+          )
+          > on (database_id)
+          max by (database_id) (oms:cloudsql_disk_autoincrease_limit_bytes)
+        for: 30m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "{{ $labels.database_id }}: al ritmo de las últimas 6 h, el disco alcanza su límite en < 24 h"
+          description: |
+            La proyección lineal de las últimas 6 h da {{ $value | humanize1024 }}B dentro de 24 h, por encima del
+            límite del auto storage increase. Cuando se alcance, el disco se llena de verdad y fallan las
+            escrituras. Hay tiempo para diagnosticar con calma: empieza por el paso 3 (slots) y el 5 (tablas).
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?database_id={{ $labels.database_id }}&predicted_bytes_24h={{ $value | printf \"%.0f\" }}&trigger=predict-24h"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=disk&from=now-2d&to=now"
+
+      - alert: CloudSQLDiskAutoIncreaseNearLimit
+        expr: |
+          max by (database_id) (cloudsql_disk_quota_bytes{database_id="oms-production:oms-pg-prod"})
+          / on (database_id)
+          max by (database_id) (oms:cloudsql_disk_autoincrease_limit_bytes)
+          >= 0.90
+        for: 1h
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "{{ $labels.database_id }}: el disco aprovisionado está al {{ $value | humanizePercentage }} del límite del auto-increase"
+          description: |
+            La red de seguridad del auto storage increase está casi gastada. El siguiente "disco lleno" ya
+            no se resolverá solo. Abre ticket de capacity planning y decide con el EM (Acción 5 del runbook).
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?database_id={{ $labels.database_id }}&quota_vs_limit={{ $value | printf \"%.2f\" }}#acción-5-subir-el-límite-del-auto-increase-impacto-medio--coste-permanente-si-se-usa--aprueba-el-em"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=disk"
+
+  - name: cloudsql-disk-prevention
+    interval: 60s
+    rules:
+
+      # V3: la causa de PM #1 (slot lógico huérfano reteniendo WAL durante semanas).
+      - alert: CloudSQLReplicationSlotInactive
+        expr: |
+          max by (slot_name, slot_type) (pg_replication_slot_retained_wal_bytes) > 5 * 1024 * 1024 * 1024
+          and on (slot_name)
+          max by (slot_name) (pg_replication_slot_active) == 0
+        for: 30m
+        labels:
+          severity: warning
+          team: sre
+          service: cloudsql-oms-pg-prod
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "Slot {{ $labels.slot_name }} ({{ $labels.slot_type }}) inactivo reteniendo {{ $value | humanize1024 }}B de WAL"
+          description: |
+            El slot de replicación {{ $labels.slot_name }} no tiene consumidor conectado y retiene
+            {{ $value | humanize1024 }}B de WAL, que crecerá sin límite. Si es lógico y nadie lo reclama,
+            es candidato a la Acción 4. Si es físico, es una réplica gestionada: NO lo toques (runbook 09).
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?slot={{ $labels.slot_name }}&slot_type={{ $labels.slot_type }}&retained_bytes={{ $value | printf \"%.0f\" }}#3-hay-slots-de-replicación-reteniendo-wal"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=wal-slots"
+
+      # V3: purga programada (Cloud Scheduler semanal → Cloud Run Job oms-ops-db-housekeeping).
+      - alert: DBHousekeepingJobStale
+        expr: |
+          (time() - max(ops_job_last_success_timestamp_seconds{job="db-housekeeping"})) > 8 * 86400
+          or
+          absent(ops_job_last_success_timestamp_seconds{job="db-housekeeping"})
+        for: 1h
+        labels:
+          severity: warning
+          team: sre
+          service: oms-ops-automation
+          runbook: "06-cloud-sql-disk-full"
+        annotations:
+          summary: "El job semanal db-housekeeping no termina con éxito desde hace > 8 días"
+          description: |
+            La purga programada (archivado del outbox publicado > 7 días, VACUUM e informe de slots y bloat)
+            no se ha completado en más de 8 días. Sin ella, outbox.events vuelve a crecer y nadie revisa los
+            slots. Revisa los logs del Cloud Run Job oms-ops-db-housekeeping y ejecútalo a mano (Acción 2).
+          runbook_url: "https://runbooks.example.com/06-cloud-sql-disk-full?section=automatizacion&job=db-housekeeping"
+          dashboard_url: "https://grafana.example.com/d/oms-db-overview?viewPanel=ops-jobs"

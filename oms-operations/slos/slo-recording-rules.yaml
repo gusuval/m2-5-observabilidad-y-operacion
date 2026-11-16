@@ -1,0 +1,114 @@
+# Recording rules de los SLOs del OMS (ventana 28 d rolling).
+# Las consumen: la política de error budget (budget restante), el dashboard oms-overview
+# (observability/grafana/oms-overview.json) y el bot semanal de #oms-alerts.
+# Las alertas de burn rate están junto a su runbook:
+#   Orders SLO 1 → runbooks/01-db-pool-saturated/alert.yaml (grupo orders-slo-burn-rate)
+#   Orders SLO 2 → runbooks/02-api-p95-high/alert.yaml
+#   Payments     → runbooks/03-stripe-payment-gateway-degraded/alert.yaml
+#
+# Evaluación cada 5 min: una ventana de 28 d no necesita más resolución y así el coste de
+# consulta sobre Managed Prometheus se mantiene bajo.
+
+groups:
+  - name: slo-sli-28d
+    interval: 5m
+    rules:
+
+      # ── Orders SLO 1: disponibilidad de POST /api/orders (objetivo 0.999) ──
+      - record: slo:orders_availability:ratio_28d
+        expr: |
+          1 - (
+            sum(increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", synthetic!="true", code=~"5.."}[28d]))
+            /
+            sum(increase(http_requests_total{job="oms-orders", endpoint="/api/orders", method="POST", synthetic!="true", code!~"4.."}[28d]))
+          )
+        labels:
+          slo: orders-availability
+          objective: "0.999"
+
+      # ── Orders SLO 2a / 2b: latencia de GET /api/orders* (objetivos 0.95 < 250 ms y 0.99 < 800 ms) ──
+      - record: slo:orders_latency_250ms:ratio_28d
+        expr: |
+          sum(increase(http_request_duration_seconds_bucket{job="oms-orders", endpoint=~"/api/orders|/api/orders/\\{id\\}", method="GET", code!~"[45]..", synthetic!="true", le="0.25"}[28d]))
+          /
+          sum(increase(http_request_duration_seconds_count{job="oms-orders", endpoint=~"/api/orders|/api/orders/\\{id\\}", method="GET", code!~"[45]..", synthetic!="true"}[28d]))
+        labels:
+          slo: orders-latency-p95
+          objective: "0.95"
+
+      - record: slo:orders_latency_800ms:ratio_28d
+        expr: |
+          sum(increase(http_request_duration_seconds_bucket{job="oms-orders", endpoint=~"/api/orders|/api/orders/\\{id\\}", method="GET", code!~"[45]..", synthetic!="true", le="0.8"}[28d]))
+          /
+          sum(increase(http_request_duration_seconds_count{job="oms-orders", endpoint=~"/api/orders|/api/orders/\\{id\\}", method="GET", code!~"[45]..", synthetic!="true"}[28d]))
+        labels:
+          slo: orders-latency-p99
+          objective: "0.99"
+
+      # ── Payments: autorización con respuesta definitiva en < 3 s (objetivo 0.99) ──
+      - record: slo:payments_authorization:ratio_28d
+        expr: |
+          sum(increase(payment_authorization_duration_seconds_bucket{outcome=~"approved|declined", synthetic!="true", le="3"}[28d]))
+          /
+          sum(increase(payment_authorization_duration_seconds_count{outcome!~"invalid_request|requires_action", synthetic!="true"}[28d]))
+        labels:
+          slo: payments-authorization
+          objective: "0.99"
+
+  - name: slo-error-budget-remaining
+    interval: 5m
+    rules:
+      # Budget restante: 1 = intacto · 0 = agotado (⚫) · < 0 = en deuda.
+      # Niveles de error-budget-policy.md: > 0.5 🟢 · 0.1–0.5 🟡 · < 0.1 🔴 · <= 0 ⚫
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - ((1 - slo:orders_availability:ratio_28d) / (1 - 0.999))
+        labels:
+          slo: orders-availability
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - ((1 - slo:orders_latency_250ms:ratio_28d) / (1 - 0.95))
+        labels:
+          slo: orders-latency-p95
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - ((1 - slo:orders_latency_800ms:ratio_28d) / (1 - 0.99))
+        labels:
+          slo: orders-latency-p99
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - ((1 - slo:payments_authorization:ratio_28d) / (1 - 0.99))
+        labels:
+          slo: payments-authorization
+
+  - name: slo-error-budget-policy
+    interval: 5m
+    rules:
+      # El nivel del equipo es el PEOR de los SLOs (regla de agregación de la política).
+      - alert: ErrorBudgetPolicyYellow
+        expr: min(slo:error_budget_remaining:ratio) <= 0.5 and min(slo:error_budget_remaining:ratio) > 0.1
+        for: 30m
+        labels:
+          severity: info
+          team: orders
+          service: oms-slo
+        annotations:
+          summary: "Error budget en 🟡: queda {{ $value | humanizePercentage }} en el peor SLO"
+          description: |
+            El budget restante del peor SLO ha bajado al {{ $value | humanizePercentage }} (umbral 🟡: 50 %).
+            Consecuencias (error-budget-policy.md): nota de impacto en disponibilidad en cada PR de feature,
+            canary obligatorio y ≥ 20 % del sprint dedicado a fiabilidad.
+          runbook_url: "https://runbooks.example.com/slos/error-budget-policy?level=yellow&remaining={{ $value | printf \"%.3f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=error-budget"
+
+      - alert: ErrorBudgetPolicyRed
+        expr: min(slo:error_budget_remaining:ratio) <= 0.1
+        for: 30m
+        labels:
+          severity: warning
+          team: orders
+          service: oms-slo
+        annotations:
+          summary: "Error budget en 🔴/⚫: queda {{ $value | humanizePercentage }}. FREEZE de features"
+          description: |
+            El budget restante del peor SLO está en {{ $value | humanizePercentage }} (umbral 🔴: 10 %, ⚫: 0 %).
+            Freeze de features: solo cambios que reduzcan riesgo y como máximo 1 despliegue al día.
+            El EM tiene que informar a producto. Si es ⚫: post-mortem del periodo y decisión de la VP.
+          runbook_url: "https://runbooks.example.com/slos/error-budget-policy?level=red&remaining={{ $value | printf \"%.3f\" }}"
+          dashboard_url: "https://grafana.example.com/d/oms-overview?viewPanel=error-budget"
